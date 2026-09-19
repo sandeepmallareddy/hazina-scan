@@ -96,8 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUT,
         metavar="DIR",
         help=f"Output directory, created if absent (default {DEFAULT_OUT}). Each "
-        f"repository gets <out>/<its directory name>/; a repeated name is "
-        f"suffixed -2, -3.",
+        f"repository's files land in <out>/<its anonymous handle>/ -- named from the "
+        f"tree's content, never from this machine's directory for it; two "
+        f"repositories with identical trees are suffixed -2, -3. See "
+        f"INDEX.local.txt, written in <out> after the run, for the map back to "
+        f"where each folder came from.",
     )
     parser.add_argument(
         "--build",
@@ -172,8 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-zip",
         action="store_true",
-        help=f"Do not write {ZIP_NAME} beside the output directory after a run over "
-        f"several repositories.",
+        help=f"Do not write {ZIP_NAME}. One archive of this run's handle folders is "
+        f"written beside the output directory by default -- for a single "
+        f"repository as much as for several.",
     )
     parser.add_argument("--version", action="version", version=f"hazina-scan {__version__}")
     return parser
@@ -249,41 +253,85 @@ def select_repos(args, err) -> list[Path] | None:
     return chosen
 
 
-def _writes_into_a_repo(
-    out_dir: Path, names: list[str], repos: list[Path]
-) -> tuple[Path, Path] | None:
-    """Find a directory this run would create that lies inside a repository being measured.
+def _repo_containing(path: Path, repos: list[Path]) -> Path | None:
+    """Which selected repository, if any, `path` sits at or inside.
 
     Writing into a measured tree changes what the next run measures: the content digest
     covers every file, so a second scan of an otherwise untouched repository would disagree
-    with the first. Both `out_dir` and each `out_dir/<name>` are checked, because
-    `--out ./results` from a parent directory can land `results/myrepo` squarely on top of
-    the repository called `myrepo`.
-
-    Returns `(the directory, the repository it is inside)`, or None when the run is clear.
+    with the first. Used both before the run, on `out_dir` itself, and at write time, on
+    each handle folder this run is about to create.
     """
-    for target in [out_dir, *(out_dir / name for name in names)]:
-        for repo in repos:
-            if target.is_relative_to(repo):
-                return target, repo
+    for repo in repos:
+        if path.is_relative_to(repo):
+            return repo
     return None
 
 
-def output_names(repos: list[Path]) -> list[str]:
-    """One output folder name per repository, in order, with repeats suffixed.
+def local_labels(repos: list[Path]) -> list[str]:
+    """One label per repository, in order, for the terminal only -- never for a file path.
 
-    Two repositories called `api` in different parents are a normal thing for a firm to
-    have, and silently writing the second over the first would lose a measurement. The
-    suffix goes on the LATER one, so the first repository named on the command line keeps
-    the plain name.
+    This is the directory name each repository sits in on THIS machine, so an operator
+    reading the terminal can tell two lines apart; it plays no part any more in choosing
+    where a repository's files are written, which is why a repeat is suffixed here rather
+    than left to collide -- two repositories called `api` in different parents are an
+    ordinary thing for a firm to have. The suffix goes on the LATER one, so the first
+    repository named on the command line keeps the plain label.
     """
-    names: list[str] = []
+    labels: list[str] = []
     seen: dict[str, int] = {}
     for repo in repos:
         base = repo.name or "repo"
         seen[base] = seen.get(base, 0) + 1
-        names.append(base if seen[base] == 1 else f"{base}-{seen[base]}")
-    return names
+        labels.append(base if seen[base] == 1 else f"{base}-{seen[base]}")
+    return labels
+
+
+class OutputClashError(Exception):
+    """This repository's handle folder would land at or inside a repository being measured.
+
+    Handles are derived from tree content, so this is not the everyday hazard the old
+    directory-name check guarded against -- it takes a content collision between the
+    handle and an actual repository path, which is not a thing a real digest produces in
+    practice. It is still checked, at the point the folder is about to be created, so the
+    remote chance of it is a reported failure for that one repository rather than a write
+    into a tree the next run would then measure differently.
+    """
+
+
+class _HandleAllocator:
+    """Turns a repository's content handle into a folder name unique within this run.
+
+    Two repositories can share a handle when their trees are byte-for-byte identical -- the
+    digest has no notion of where either one is checked out. This keeps one claim count per
+    handle behind a lock, so of two repositories finishing with the same handle, whichever
+    claims it first keeps the plain form and the next gets `-2`, and so on.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._claims: dict[str, int] = {}
+
+    def claim(self, base: str) -> str:
+        with self._lock:
+            self._claims[base] = self._claims.get(base, 0) + 1
+            n = self._claims[base]
+        return base if n == 1 else f"{base}-{n}"
+
+
+def _diagnostic_handle(repo: Path, label: str) -> str:
+    """A handle to show for a repository whose measurement never produced one.
+
+    The terminal line and the index row still need something in the handle column even
+    when `orchestrator.measure` raised before returning a row. The content digest is cheap
+    and does not depend on the measurement that failed, so it is tried first and gives the
+    same `repo-<hex>` a successful run would have shown; if even that cannot be read, the
+    local label stands in instead, so two such failures in one run still print two
+    distinguishable lines.
+    """
+    try:
+        return f"repo-{orchestrator.repo_digest(repo)[:12]}"
+    except Exception:  # noqa: BLE001 -- best effort only, a display fallback follows
+        return f"FAILED-{label}"
 
 
 # ---------------------------------------------------------------------------
@@ -357,22 +405,36 @@ class _Printer:
             print(text, file=sys.stderr, flush=True)
 
 
-def measure_one(repo: Path, name: str, args, out_dir: Path, printer: _Printer) -> dict:
-    """Measure one repository, write its three files, and say what came out.
+def measure_one(
+    repo: Path,
+    name: str,
+    args,
+    out_dir: Path,
+    printer: _Printer,
+    repos: list[Path],
+    allocator: _HandleAllocator,
+) -> dict:
+    """Measure one repository, write its three files under its handle, and say what came out.
 
-    Returns `{"name", "status", "error"}` and RAISES NOTHING. The whole body is inside one
-    `try`, not just the call to `measure`: a full disk in `write_outputs`, an undeclared
-    field in `review`, a broken pipe on the way to the terminal -- from the other
-    repositories' point of view those are the same event as a collector raising, and any
-    one of them escaping would take the remaining repositories, the per-repository status
-    lines and the archive with it. The orchestrator is right to let a broken collector stop
-    its OWN run; this layer is the one that knows there are others waiting.
+    Returns `{"name", "handle", "repo", "status", "error"}` and RAISES NOTHING. The whole
+    body is inside one `try`, not just the call to `measure`: a full disk in
+    `write_outputs`, an undeclared field in `review`, a broken pipe on the way to the
+    terminal -- from the other repositories' point of view those are the same event as a
+    collector raising, and any one of them escaping would take the remaining repositories,
+    the per-repository status lines and the archive with it. The orchestrator is right to
+    let a broken collector stop its OWN run; this layer is the one that knows there are
+    others waiting.
+
+    `name` is the LOCAL label, used only for the stderr prefix and the progress lines --
+    `handle` is what the output folder and the zip entries are named after, and it is not
+    known until `measure` returns a row.
 
     The failure is reported on stderr as `FAILED <name>: <class>: <message>` and returned,
     so the caller can exit 1 deliberately rather than by accident.
     """
     clock = orchestrator.LaneClock(label=printer.label(name))
     deadline = orchestrator.Deadline(args.budget)
+    handle: str | None = None
     try:
         for line in report.plan_lines(repo, args.build_level, args.budget, args.max_build_projects):
             printer.progress(name, line)
@@ -392,7 +454,14 @@ def measure_one(repo: Path, name: str, args, out_dir: Path, printer: _Printer) -
             max_build_projects=args.max_build_projects,
             full_attempt_seconds=args.full_attempt_seconds,
         )
-        written = orchestrator.write_outputs(out_dir / name, row, measurement)
+        handle = allocator.claim(row["fake_repo_name"])
+        target = out_dir / handle
+        blocker = _repo_containing(target, repos)
+        if blocker is not None:
+            raise OutputClashError(
+                f"{target} is at or inside the repository being measured, {blocker}"
+            )
+        written = orchestrator.write_outputs(target, row, measurement)
 
         timing = [
             report.timing(clock),
@@ -430,24 +499,84 @@ def measure_one(repo: Path, name: str, args, out_dir: Path, printer: _Printer) -
         # The printer stamps the repository's name on every line it emits in a
         # multi-repository run, so naming it again here produces `bad: FAILED bad: ...`.
         printer.progress(name, f"FAILED: {type(exc).__name__}: {exc}")
-        return {"name": name, "status": None, "error": f"{type(exc).__name__}: {exc}"}
-    return {"name": name, "status": row.get("status"), "error": None}
+        if handle is None:
+            handle = _diagnostic_handle(repo, name)
+        return {
+            "name": name,
+            "handle": handle,
+            "repo": str(repo),
+            "status": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "name": name,
+        "handle": handle,
+        "repo": str(repo),
+        "status": row.get("status"),
+        "error": None,
+    }
 
 
-def write_zip(out_dir: Path) -> Path:
-    """Archive the output directory beside itself, its own name as the top-level folder.
+def write_zip(out_dir: Path, handles: list[str]) -> Path:
+    """Archive exactly this run's handle folders, beside the output directory itself.
 
     Beside and not inside, because an archive written into the directory it is archiving
     either contains a truncated copy of itself or has to be special-cased out; and the
     top-level folder is kept so unpacking it in a downloads directory produces one folder
-    rather than a scatter of repository names.
+    rather than a scatter of handles. Walking `handles` rather than everything under
+    `out_dir` is what keeps stale content from an earlier run into the same `--out`, or
+    anything else an operator happens to keep there, out of a file meant to leave the
+    machine -- `--out .` must not turn the whole working directory into an attachment.
     """
     zip_path = out_dir.parent / ZIP_NAME
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(out_dir.rglob("*")):
-            if path.is_file():
-                archive.write(path, str(Path(out_dir.name) / path.relative_to(out_dir)))
+        for handle in sorted(set(handles)):
+            folder = out_dir / handle
+            for path in sorted(folder.rglob("*")):
+                if path.is_file():
+                    archive.write(path, str(Path(out_dir.name) / path.relative_to(out_dir)))
     return zip_path
+
+
+INDEX_NAME = "INDEX.local.txt"
+
+#: Said at the top of the local index every time it is written, so opening it away from
+#: this tool's own docs still explains what it is and why it never travels with the zip.
+INDEX_HEADER = (
+    "# hazina-scan index -- LOCAL ONLY. This file is not included in hazina-out.zip.",
+    "# It maps each output folder to the repository it came from on this machine.",
+)
+
+
+def write_index(out_dir: Path, entries: list[tuple[str, str, str]]) -> Path:
+    """Write or update `INDEX.local.txt`, the one file that names a local path at all.
+
+    `entries` is `(handle, absolute repo path, status or "FAILED")` for every repository
+    this run touched. A run into an `--out` an earlier run already wrote to keeps that
+    file's other rows untouched and only replaces the ones this run has a fresh answer
+    for -- reading the old lines, swapping in the new ones by handle, and appending
+    whatever handle is new, is simpler than reasoning about a merge.
+    """
+    path = out_dir / INDEX_NAME
+    fresh = {handle: f"{handle}\t{repo_path}\t{status}" for handle, repo_path, status in entries}
+    kept: list[str] = []
+    seen: set[str] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            handle = line.split("\t", 1)[0]
+            if handle in fresh:
+                kept.append(fresh[handle])
+                seen.add(handle)
+            else:
+                kept.append(line)
+    for handle in fresh:
+        if handle not in seen:
+            kept.append(fresh[handle])
+            seen.add(handle)
+    path.write_text("\n".join((*INDEX_HEADER, *kept)) + "\n", encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -467,42 +596,55 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     out_dir = Path(args.out).expanduser().resolve()
-    names = output_names(repos)
+    names = local_labels(repos)
 
-    clash = _writes_into_a_repo(out_dir, names, repos)
-    if clash is not None:
-        target, repo = clash
+    blocker = _repo_containing(out_dir, repos)
+    if blocker is not None:
         print(
-            f"error: --out would write inside the repository being measured: {target}\n"
-            f"       is inside {repo}. Nothing is ever written into a measured tree, "
+            f"error: --out would write inside the repository being measured: {out_dir}\n"
+            f"       is inside {blocker}. Nothing is ever written into a measured tree, "
             f"because the files written would change the next run's repo_digest.\n"
             f"       choose a directory outside it, for example --out "
-            f"{repo.parent / 'hazina-out'}",
+            f"{blocker.parent / 'hazina-out'}",
             file=sys.stderr,
         )
         return 2
 
     printer = _Printer(prefix=len(repos) > 1)
+    allocator = _HandleAllocator()
 
     results: list[dict] = []
     if len(repos) == 1:
-        results.append(measure_one(repos[0], names[0], args, out_dir, printer))
+        results.append(measure_one(repos[0], names[0], args, out_dir, printer, repos, allocator))
     else:
         workers = max(1, min(args.jobs if args.jobs > 0 else 1, len(repos)))
         with cf.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
-                pool.submit(measure_one, repo, name, args, out_dir, printer)
+                pool.submit(measure_one, repo, name, args, out_dir, printer, repos, allocator)
                 for repo, name in zip(repos, names, strict=True)
             ]
             results = [f.result() for f in futures]
 
-    if len(repos) > 1:
-        if not args.no_zip and out_dir.is_dir():
-            print(f"wrote {write_zip(out_dir)}")
-        for result in results:
-            if result["error"]:
-                print(f"{result['name']}: FAILED -- {result['error']}")
-            else:
-                print(f"{result['name']}: {result['status']}")
+    # The index is written whatever the outcome -- even a run that measured nothing still
+    # owes the operator a record of what was tried and what happened to it.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index_path = write_index(
+        out_dir,
+        [(r["handle"], r["repo"], r["status"] or "FAILED") for r in results],
+    )
+
+    for result in results:
+        handle_display = result["handle"] or "FAILED"
+        if result["error"]:
+            print(f"{handle_display}  <-  {result['name']}: FAILED -- {result['error']}")
+        else:
+            print(f"{handle_display}  <-  {result['name']}: {result['status']}")
+
+    if not args.no_zip:
+        handles = [r["handle"] for r in results if r["error"] is None]
+        if handles:
+            print(f"wrote {write_zip(out_dir, handles)}")
+
+    print(f"index (local only, not in the zip): {index_path}")
 
     return 1 if any(r["error"] for r in results) else 0

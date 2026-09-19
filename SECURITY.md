@@ -54,7 +54,10 @@ against what the tool is actually meant to do.
   `./hazina-out`), never inside the repository being measured. The build check is the one
   exception to "nothing is written in your tree", and it writes there only what the
   project's own install and build commands write: lockfiles, dependency directories, build
-  output. Those are snapshotted first and put back afterwards.
+  output. Those are snapshotted first and put back afterwards. Each repository's output
+  folder is named after an anonymous, content-derived handle rather than its local
+  directory name, and the only file that records which local path a folder came from,
+  `INDEX.local.txt`, stays on your machine and is excluded from `hazina-out.zip`.
 - **This tool** opens no network connection: no telemetry, no crash reporting, no version
   check, no upload of any kind. Your project's own package manager, run by the build
   check, reaches whatever index your manifests point it at — that is its traffic, not

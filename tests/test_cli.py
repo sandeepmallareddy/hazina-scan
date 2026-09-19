@@ -7,6 +7,11 @@ function while skipping the part an operator actually uses.
 `--no-build` is passed almost everywhere, because the check executes the measured
 repository's own install and test commands and none of the tests below are about that.
 The few that ARE about it say so, and ask for the cheaper level.
+
+Output folders are named after a repository's content handle, not its local directory
+name, so a test that needs to find a repository's folder computes the handle itself with
+`hazina_scan.orchestrator.repo_digest` -- the same function the tool uses -- rather than
+guessing a path.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-from hazina_scan import cli
+from hazina_scan import cli, orchestrator
 
 
 def run(*args):
@@ -26,15 +31,31 @@ def run(*args):
     )
 
 
-def tiny_repo(path: Path) -> Path:
-    """A one-commit git repository at `path`, parents created."""
+def tiny_repo(path: Path, marker: str | None = None) -> Path:
+    """A one-commit git repository at `path`, parents created.
+
+    `marker` (default: the directory's own name) goes into the one tracked file, so two
+    calls at two different paths produce two different content handles unless a test asks
+    otherwise by passing the same marker twice.
+    """
     path.mkdir(parents=True, exist_ok=True)
     ident = ["-c", "user.name=d", "-c", "user.email=d@e.com"]
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
-    (path / "a.py").write_text("x = 1\n")
+    (path / "a.py").write_text(f"x = 1  # {marker if marker is not None else path.name}\n")
     subprocess.run(["git", "-C", str(path), *ident, "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(path), *ident, "commit", "-q", "-m", "i"], check=True)
     return path
+
+
+def handle_of(repo: Path) -> str:
+    return f"repo-{orchestrator.repo_digest(repo)[:12]}"
+
+
+def read_index(out: Path) -> dict[str, tuple[str, str]]:
+    """`{handle: (repo path, status)}` parsed back out of `INDEX.local.txt`."""
+    lines = (out / "INDEX.local.txt").read_text(encoding="utf-8").splitlines()
+    rows = [ln.split("\t") for ln in lines if ln and not ln.startswith("#")]
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 # --------------------------------------------------------------------------
@@ -46,8 +67,24 @@ def test_single_repo(py_repo, tmp_path):
     out = tmp_path / "out"
     proc = run(str(py_repo), "--no-build", "--out", str(out))
     assert proc.returncode == 0, proc.stderr
-    assert (out / "repo" / "measurement.json").exists()
+    handle = handle_of(py_repo)
+    assert (out / handle / "measurement.json").exists()
+    row = json.loads((out / handle / "codebase_repos.json").read_text())
+    assert row["fake_repo_name"] == handle
     assert "acme/demo" in proc.stdout and "Python" in proc.stdout
+
+    zpath = tmp_path / "hazina-out.zip"
+    assert zpath.exists()
+    names = sorted(zipfile.ZipFile(zpath).namelist())
+    assert names == sorted(
+        f"out/{handle}/{fname}"
+        for fname in ("codebase_repos.json", "codebase_repos.csv", "measurement.json")
+    )
+
+    index_path = out / "INDEX.local.txt"
+    assert index_path.exists()
+    assert str(py_repo) in index_path.read_text(encoding="utf-8")
+    assert "INDEX.local.txt" not in [Path(n).name for n in names]
 
 
 def test_build_discover_runs_and_says_which_level_ran(py_repo, tmp_path):
@@ -57,7 +94,11 @@ def test_build_discover_runs_and_says_which_level_ran(py_repo, tmp_path):
     proc = run(str(py_repo), "--build", "discover", "--out", str(tmp_path / "o"))
     assert proc.returncode == 0, proc.stderr
     assert "[build] ran at level discover" in proc.stderr
-    block = json.loads((tmp_path / "o" / "repo" / "measurement.json").read_text())
+    # The build check can leave the tree not quite as it found it (restoration is best
+    # effort), so the handle is read back from the run's own index rather than
+    # recomputed from the now-possibly-different tree.
+    handle = next(iter(read_index(tmp_path / "o")))
+    block = json.loads((tmp_path / "o" / handle / "measurement.json").read_text())
     assert block["ext_signals"]["build"]["build_level"] == "discover"
 
 
@@ -86,18 +127,19 @@ def test_no_build_executes_nothing_and_says_nothing_about_it(py_repo, tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "MODIFIES THE CHECKOUT" not in proc.stderr
     assert "[build] ran at level" not in proc.stderr
-    doc = json.loads((tmp_path / "o" / "repo" / "measurement.json").read_text())
+    handle = handle_of(py_repo)
+    doc = json.loads((tmp_path / "o" / handle / "measurement.json").read_text())
     assert doc["ext_signals"]["build"] is None
     assert "build: not run" in proc.stdout
 
 
-def test_all_dir_and_zip(repo_builder, tmp_path):
+def test_all_dir_and_zip(tmp_path):
     root = tmp_path / "code"
     root.mkdir()
     for n in ("one", "two"):
         (root / n).mkdir()
         subprocess.run(["git", "-C", str(root / n), "init", "-q"], check=True)
-        (root / n / "a.py").write_text("x\n")
+        (root / n / "a.py").write_text(f"x = 1  # {n}\n")
         subprocess.run(
             [
                 "git",
@@ -132,11 +174,25 @@ def test_all_dir_and_zip(repo_builder, tmp_path):
     out = tmp_path / "out"
     proc = run("--all", str(root), "--no-build", "--out", str(out))
     assert proc.returncode == 0, proc.stderr
-    assert (out / "one" / "codebase_repos.csv").exists() and (
-        out / "two" / "codebase_repos.csv"
-    ).exists()
+
+    handles = {n: handle_of(root / n) for n in ("one", "two")}
+    for h in handles.values():
+        assert (out / h / "codebase_repos.csv").exists()
+
     names = zipfile.ZipFile(tmp_path / "hazina-out.zip").namelist()
-    assert any(n.endswith("one/measurement.json") for n in names)
+    assert len(names) == 6  # two handle folders, three files each, nothing more
+    for h in handles.values():
+        assert any(n.endswith(f"{h}/measurement.json") for n in names)
+    assert not any("INDEX.local.txt" in n for n in names)
+
+    for n, h in handles.items():
+        assert f"{h}  <-  {n}: measured" in proc.stdout
+    assert f"index (local only, not in the zip): {out / 'INDEX.local.txt'}" in proc.stdout
+
+    idx = read_index(out)
+    for n, h in handles.items():
+        assert idx[h][0] == str(root / n)
+        assert idx[h][1] == "measured"
 
 
 def test_usage_errors(tmp_path):
@@ -166,26 +222,64 @@ def test_no_repositories_given(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Output folder naming
+# Output folder naming: the content handle, not the local directory name
 # --------------------------------------------------------------------------
 
 
-def test_duplicate_dirnames_get_a_suffix(tmp_path):
-    first = tiny_repo(tmp_path / "a" / "dup")
-    second = tiny_repo(tmp_path / "b" / "dup")
+def test_identical_trees_get_a_suffixed_handle(repo_builder, tmp_path):
+    """Two repositories with byte-for-byte identical trees, checked out under different
+    local directory names, still need two distinct output folders."""
+    files = {"a.py": "x = 1\n", "README.md": "hi\n"}
+    first = repo_builder(files, name="one")
+    second = repo_builder(files, name="two")
+    out = tmp_path / "out"
+    proc = run(str(first), str(second), "--no-build", "--out", str(out))
+    assert proc.returncode == 0, proc.stderr
+
+    base = handle_of(first)
+    assert base == handle_of(second)  # identical trees really do share a base handle
+    assert (out / base / "measurement.json").exists()
+    assert (out / f"{base}-2" / "measurement.json").exists()
+
+    names = zipfile.ZipFile(tmp_path / "hazina-out.zip").namelist()
+    assert any(n.endswith(f"{base}/measurement.json") for n in names)
+    assert any(n.endswith(f"{base}-2/measurement.json") for n in names)
+
+    idx = read_index(out)
+    assert {idx[base][0], idx[f"{base}-2"][0]} == {str(first), str(second)}
+
+
+def test_duplicate_local_dirnames_get_distinct_terminal_labels(tmp_path):
+    """Two repositories share a directory name on this machine but not any content; the
+    terminal still has to tell them apart even though their output folders are named
+    after content and do not collide at all."""
+    first = tiny_repo(tmp_path / "a" / "dup", marker="a")
+    second = tiny_repo(tmp_path / "b" / "dup", marker="b")
     out = tmp_path / "out"
     proc = run(str(first), str(second), "--no-build", "--out", str(out), "--no-zip")
     assert proc.returncode == 0, proc.stderr
-    assert (out / "dup" / "measurement.json").exists()
-    assert (out / "dup-2" / "measurement.json").exists()
+    assert any(ln.endswith("<-  dup: measured") for ln in proc.stdout.splitlines())
+    assert any(ln.endswith("<-  dup-2: measured") for ln in proc.stdout.splitlines())
+
+
+def test_the_local_directory_name_never_appears_in_the_zip(repo_builder, tmp_path):
+    files = {"a.py": "x = 1\n"}
+    repo = repo_builder(files, name="acme-secret-billing")
+    out = tmp_path / "out"
+    proc = run(str(repo), "--no-build", "--out", str(out))
+    assert proc.returncode == 0, proc.stderr
+    with zipfile.ZipFile(tmp_path / "hazina-out.zip") as zf:
+        assert not any(b"acme-secret-billing" in n.encode() for n in zf.namelist())
+        for member in zf.namelist():
+            assert b"acme-secret-billing" not in zf.read(member)
 
 
 # --------------------------------------------------------------------------
-# Zipping, review and concurrency
+# Zipping, the local index, review and concurrency
 # --------------------------------------------------------------------------
 
 
-def test_no_zip_leaves_no_archive(tmp_path):
+def test_no_zip_leaves_no_archive_but_still_writes_the_index(tmp_path):
     first = tiny_repo(tmp_path / "a" / "one")
     second = tiny_repo(tmp_path / "b" / "two")
     out = tmp_path / "out"
@@ -193,6 +287,22 @@ def test_no_zip_leaves_no_archive(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / "hazina-out.zip").exists()
     assert not list(tmp_path.glob("*.zip"))
+    assert (out / "INDEX.local.txt").exists()
+
+
+def test_stale_content_under_out_is_not_swept_into_the_zip(py_repo, tmp_path):
+    """`--out` pointing at a directory that already holds unrelated files -- think
+    `--out .` -- must not turn those files into zip entries."""
+    out = tmp_path / "out"
+    out.mkdir(parents=True)
+    (out / "junk.txt").write_text("leftover\n")
+    (out / "old").mkdir()
+    (out / "old" / "x.json").write_text("{}\n")
+    proc = run(str(py_repo), "--no-build", "--out", str(out))
+    assert proc.returncode == 0, proc.stderr
+    names = zipfile.ZipFile(tmp_path / "hazina-out.zip").namelist()
+    assert not any("junk.txt" in n for n in names)
+    assert not any("old" in n for n in names)
 
 
 def test_review_prints_every_field(py_repo, tmp_path):
@@ -209,8 +319,8 @@ def test_jobs_one_serialises(tmp_path):
     out = tmp_path / "out"
     proc = run(str(first), str(second), "--no-build", "--out", str(out), "--jobs", "1")
     assert proc.returncode == 0, proc.stderr
-    assert (out / "one" / "measurement.json").exists()
-    assert (out / "two" / "measurement.json").exists()
+    assert (out / handle_of(first) / "measurement.json").exists()
+    assert (out / handle_of(second) / "measurement.json").exists()
     assert "one: " in proc.stdout and "two: " in proc.stdout
 
 
@@ -234,9 +344,14 @@ def test_one_repo_raising_exits_1_and_the_rest_still_run(tmp_path, monkeypatch, 
     code = cli.main([str(good), str(bad), "--no-build", "--out", str(out), "--no-zip"])
     captured = capsys.readouterr()
     assert code == 1
-    assert (out / "good" / "measurement.json").exists()
-    assert not (out / "bad").exists()
+    good_handle = handle_of(good)
+    assert (out / good_handle / "measurement.json").exists()
     assert "bad: FAILED: RuntimeError: collector exploded" in captured.err.splitlines()
+    assert f"index (local only, not in the zip): {out / 'INDEX.local.txt'}" in captured.out
+    idx = read_index(out)
+    assert idx[good_handle] == (str(good), "measured")
+    bad_entries = [v for k, v in idx.items() if v[0] == str(bad)]
+    assert bad_entries == [(str(bad), "FAILED")]
 
 
 # --------------------------------------------------------------------------
@@ -330,8 +445,9 @@ def test_the_same_repository_named_twice_is_measured_once(py_repo, tmp_path):
     out = tmp_path / "out"
     proc = run(str(py_repo), str(py_repo), "--no-build", "--out", str(out))
     assert proc.returncode == 0, proc.stderr
-    assert (out / "repo" / "measurement.json").exists()
-    assert not (out / "repo-2").exists()
+    handle = handle_of(py_repo)
+    assert (out / handle / "measurement.json").exists()
+    assert not (out / f"{handle}-2").exists()
 
 
 def test_every_lane_line_names_its_repository(tmp_path):
@@ -359,10 +475,11 @@ def test_a_failure_after_measuring_is_reported_and_the_run_finishes(tmp_path, mo
     It must not take the other repositories, the status lines or the exit code with it."""
     good = tiny_repo(tmp_path / "a" / "good")
     bad = tiny_repo(tmp_path / "b" / "bad")
+    bad_digest = orchestrator.repo_digest(bad)
     real = cli.orchestrator.write_outputs
 
     def fake(out_dir, row, measurement):
-        if Path(out_dir).name == "bad":
+        if row.get("repo_digest") == bad_digest:
             raise OSError("disk went away")
         return real(out_dir, row, measurement)
 
@@ -371,11 +488,15 @@ def test_a_failure_after_measuring_is_reported_and_the_run_finishes(tmp_path, mo
     code = cli.main([str(good), str(bad), "--no-build", "--out", str(out), "--jobs", "1"])
     captured = capsys.readouterr()
     assert code == 1
-    assert (out / "good" / "measurement.json").exists()
+    good_handle = handle_of(good)
+    assert (out / good_handle / "measurement.json").exists()
     assert "bad: FAILED: OSError: disk went away" in captured.err.splitlines()
     assert "good: measured" in captured.out
     assert "bad: FAILED -- OSError: disk went away" in captured.out
     assert (tmp_path / "hazina-out.zip").exists()  # the zip step still ran
+    names = zipfile.ZipFile(tmp_path / "hazina-out.zip").namelist()
+    assert any(n.endswith(f"{good_handle}/measurement.json") for n in names)
+    assert len(names) == 3  # only the good repository's three files
 
 
 # --------------------------------------------------------------------------
@@ -401,13 +522,20 @@ def test_an_out_directory_beside_the_repository_is_allowed(py_repo, tmp_path):
     out = tmp_path / "beside"
     proc = run(str(py_repo), "--no-build", "--out", str(out))
     assert proc.returncode == 0, proc.stderr
-    assert (out / "repo" / "measurement.json").exists()
+    assert (out / handle_of(py_repo) / "measurement.json").exists()
 
 
-def test_an_out_directory_whose_subfolder_lands_on_the_repository_is_refused(tmp_path):
-    """`--out .` from a repository's parent aims `<out>/myrepo` at `myrepo` itself."""
-    repo = tiny_repo(tmp_path / "myrepo")
+def test_a_handle_landing_on_the_repository_itself_is_reported_failed(tmp_path):
+    """Handles never collide with a real repository path in practice, but the guard is
+    still exercised here by contriving exactly that: a repository whose own directory is
+    named after its future handle."""
+    scratch = tiny_repo(tmp_path / "scratch")
+    handle = handle_of(scratch)
+    repo = tmp_path / handle
+    scratch.rename(repo)  # the digest depends on content, not path, so this is safe
     proc = run(str(repo), "--no-build", "--out", str(tmp_path))
-    assert proc.returncode == 2
-    assert "would write inside the repository being measured" in proc.stderr
-    assert not (repo / "measurement.json").exists()
+    assert proc.returncode == 1, proc.stderr
+    assert f"{handle}  <-  {handle}: FAILED --" in proc.stdout
+    assert "at or inside the repository being measured" in proc.stdout
+    idx = read_index(tmp_path)
+    assert idx[handle] == (str(repo), "FAILED")

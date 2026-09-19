@@ -23,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts without an executable bit) — the matrix runs Windows as allowed-to-fail until
   then.
 
+## [0.3.0] - 2026-09-19
+
+### Changed
+
+- **Output folders are named by the anonymous handle** (`repo-<hex>`, from the row's
+  `fake_repo_name`) **instead of the repository's local directory name.** A directory name
+  is exactly the kind of thing this tool promises never travels in the shared zip, and a
+  folder named after one did precisely that; two repositories with identical trees still
+  get distinct folders, suffixed `-2`, `-3`.
+- **One `hazina-out.zip` is always written**, for a single repository measured alone just
+  as for several, unless `--no-zip` is passed. It holds only the handle folders this run
+  produced -- never stale content left under `--out` from an earlier run, and never
+  anything else parked there.
+
+### Added
+
+- **`INDEX.local.txt`**, written beside the handle folders after every run: the one place
+  that maps a folder back to the repository it came from on this machine. It stays on the
+  machine and is never included in the zip.
+
 ## [0.2.0] - 2026-09-19
 
 ### Documentation
