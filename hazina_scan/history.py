@@ -161,16 +161,17 @@ def ref_kind(refname: str) -> str:
 
 
 def ref_candidates(repo: Path, limit: int = MAX_CANDIDATES) -> list[dict]:
-    """Candidate refs, deepest first, each with cheap aggregate evidence.
+    """Rank refs by commit depth and attach cheap, aggregate-only evidence to the deepest ones.
 
-    The evidence is reachable commits, files in the tree, distinct top-level entries, the
-    date of the tip commit, the kind of ref it is, and how many other refs point at the
-    same commit. All of it is aggregate: a count of files, never a file name, so nothing
-    collected here could carry a path out even if something downstream wanted one.
+    Per ref: how many commits are reachable from it, how many files and how many distinct
+    top-level entries its tree holds, the tip commit's date, what kind of ref it is, and how
+    many other refs share that same tip. Every one of those is a count or a label, never a
+    path or a filename, so this function has nothing to leak even if a caller mishandled it.
 
-    Cost stays flat on a repository with hundreds of refs because of three bounds:
-    enumeration stops at `MAX_REFS_ENUMERATED`, refs sharing a tip commit collapse into a
-    single candidate, and only the `limit` deepest survivors are walked for tree evidence.
+    Three limits keep the cost from growing with the ref count: `MAX_REFS_ENUMERATED` caps
+    how many refs are looked at in the first place, refs pointing at the same tip commit are
+    merged into one candidate before anything expensive runs, and tree evidence is gathered
+    only for the `limit` candidates that sorted deepest.
     """
     raw = run_git(
         repo, "for-each-ref", "--format=%(refname)%09%(objecttype)%09%(objectname)%09%(*objectname)"

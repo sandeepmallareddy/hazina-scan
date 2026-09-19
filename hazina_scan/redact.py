@@ -250,9 +250,10 @@ NAMES_AN_ENV_VAR = {
     "env_vars_missing_from_example",
 }
 
-#: Fields `schema.py` has already matched against a closed list of words. Scrubbing them
-#: cannot add safety and does destroy them -- the masks above read "Next.js" as a filename
-#: and "GitHub Actions" as a class name -- so both walkers step over them.
+#: Fields whose values `schema.py` has already checked against a fixed vocabulary. Neither
+#: walker below scrubs these, because doing so buys no extra safety and actively mangles
+#: the value -- the masking patterns above would treat "Next.js" as a filename to redact and
+#: "GitHub Actions" as though it were a class name.
 SCRUB_EXEMPT = NAMES_A_TECHNOLOGY | IS_OUR_OWN_WORD | schema.CLOSED_VOCABULARY_KEYS
 AUDIT_EXEMPT = SCRUB_EXEMPT | IS_PROVENANCE
 

@@ -1,63 +1,59 @@
-"""Which company a repository belongs to, read out of the code.
+"""Guess the company a repository belongs to from signals inside the checkout itself.
 
-A measurement of somebody else's repository is a measurement *about* somebody, and until
-this block existed nothing in the output said who. That question cannot be left to whoever
-reads the report: a repository called `payments-core` belongs to whichever company wrote
-it, and the numbers beside it do not distinguish the company from a fork of the company.
+Every other measurement in this tool is silent about who it is measuring. A row that says
+`payments-core` has a certain size and a certain language mix says nothing about which
+company owns it, or whether it is that company's own repository at all rather than a public
+fork of it. This module closes that gap: it gathers evidence, proposes at most a short list
+of candidates, and leaves the actual decision to a person. `none` is not a failure state
+here -- it is what a tree with no evidence in it honestly produces, and the person reviewing
+the output is expected to overrule a wrong or missing guess rather than trust it blindly.
 
-So this reads the evidence and a human confirms it. The confirmation is the load-bearing
-half. Everything here is evidence offered to somebody who can overrule it, which is why
-`none` is a first-class answer rather than a failure: a tree that says nothing gets a
-blank, not a guess.
+WHY A NAME IS ALLOWED OUT AT ALL
+Every other collector in this tool has a strict no-identity rule: no author, no address, no
+hostname, no filesystem path. This module is the deliberate exception, because the company
+a repository belongs to is not incidental information the way an author's name is -- it is
+the entire question this module exists to answer. The exception is scoped to that one class
+of value, not opened generally: `schema.py` still declares this block field by field and
+still refuses anything undeclared, and `is_emittable_name` further down is what stops some
+other kind of string from riding out through this module dressed up as a company name.
 
-THE ONE BLOCK THAT NAMES A THIRD PARTY
---------------------------------------
-Everywhere else this tool refuses identity outright -- no author names, no addresses, no
-hostnames, no paths. Here a name leaves, and it leaves because the thing being described
-IS a company and naming it is the entire point of the flow. That exception is to a class
-of name, not to a field: `schema.py` still declares the block field by field and still
-refuses to write anything undeclared, and `is_emittable_name` below is the gate that keeps
-anything else from riding out wearing a company's shape.
+WHERE THE EVIDENCE COMES FROM
+Four independent families are read, each tagged with its own name so the eventual answer
+carries its provenance:
 
-FOUR FAMILIES, AND THE TWO THAT ARE REFUSED
--------------------------------------------
-Four kinds of evidence are gathered, each under a family name that travels with the answer:
+* `licence_file` -- the copyright holder named in a root LICENSE, NOTICE or COPYING file.
+* `copyright_header` -- a name repeated across more than one source file's header comment.
+* `git_remote` -- the organisation segment of the `origin` remote's URL.
+* `package_manifest` -- a namespace declared in a root manifest.
 
-* `licence_file` -- whoever the root licence, notice or copying file says holds copyright.
-* `copyright_header` -- the holder named in source-file headers, counted only when the same
-  one turns up repeatedly.
-* `git_remote` -- the organisation part of the `origin` URL.
-* `package_manifest` -- a namespace registered in a manifest at the root.
+The manifest family only ever reads a namespace, never a person: an npm scope, a Composer
+vendor, the organisation part of a Go module path or a Maven groupId, a marketplace
+publisher slug. Fields like `author`, `authors`, `maintainers` and `contact` are skipped on
+purpose, because those hold individuals, and a person's name is refused here exactly as it
+would be anywhere else in this tool regardless of which file it turned up in. Ecosystems
+whose manifests carry only an author field and no namespace -- Cargo, PyPI -- contribute
+nothing to this family as a direct result.
 
-Namespaces are all the manifest family will take: a scope in npm, a vendor in Composer, the
-organisation segment of a Go module path or a Maven groupId, a marketplace publisher. The
-`author`, `authors`, `maintainers` and `contact` entries are skipped, since each holds a
-person, and this tool does not emit a person's name whatever file it was found in -- a name
-in a manifest is no less personal than one in a commit. The consequence is that ecosystems
-with a flat namespace, Cargo and PyPI among them, supply nothing at all here, because the
-only name their manifests carry is the author's.
+Two more possible signals are deliberately left uncollected, and `schema.py` records both
+refusals explicitly so a reviewer sees them rather than wondering why a field is empty.
+Email domains are skipped because they are derived from an address, which this module never
+touches. Hostnames pulled from CI or config files, registry paths and cloud project IDs are
+skipped as a form of path, and they were also the least reliable of the candidate signals,
+so excluding them costs little.
 
-Two further signals are deliberately not collected, and both refusals are declared in
-`schema.py` so they show up in the review a repository owner reads before sending
-anything. Author email DOMAINS are derived from addresses, which the identity rule forbids
-by name. Config and CI hostnames, registry paths and cloud project names collide with the
-no-paths rule as well, and are the weakest evidence of the six -- the widest widening for
-the least return.
+WHY NOTHING NUMERIC IS EMITTED
+Internally, a copyright name's file count and an industry keyword's hit count are both
+tallied -- but neither number leaves this module. A hit count next to a name is a confidence
+score wearing a disguise, and confidence scores read as authority they have not earned here.
+What is returned instead is the chosen name (or none) plus which family or families backed
+it, phrased as "found in your licence file" rather than as a percentage.
 
-NO NUMBER LEAVES THIS MODULE
-----------------------------
-The copyright family counts how many files a header appears in, and the industry guess
-counts keyword hits. Both counts stop at a return statement. A per-name hit count is a
-confidence number wearing different clothes, and a percentage printed beside a company's
-name reads as a grade. What leaves is the outcome word and the family names -- provenance,
-"read out of your licence file" -- which is the only form the confirm step wants.
-
-EVERY READER IS BOUNDED AND NONE OF THEM RAISE
-----------------------------------------------
-A repository is untrusted input: as large as somebody else decided, and possibly hostile.
-Every read here is capped in bytes, the file walk is capped in files, and each family
-returns nothing rather than failing. Losing the whole measurement to somebody's malformed
-`pom.xml` would be a bad trade for a question a human can answer by typing.
+WHY NOTHING HERE CAN THROW
+A repository is somebody else's input, arbitrary in size and not necessarily well-formed.
+Every file read in this module has a byte cap, every directory walk has a file-count cap,
+and every family returns an empty result on trouble rather than propagating an exception.
+Losing an entire run's worth of measurement to one malformed `pom.xml` would trade a cheap,
+human-answerable question for an outage.
 """
 
 from __future__ import annotations
@@ -74,8 +70,9 @@ from . import vocab
 #: and past three the question gets harder to answer rather than better informed.
 MAX_CANDIDATES = 3
 
-#: A total ceiling on top of the name pattern's own bounds. Eight words of forty characters
-#: is 320, and nothing that long is a company name; it is a sentence out of a licence file.
+#: An overall length cap that sits on top of whatever the name pattern itself already
+#: restricts. Past roughly eight forty-character words, a candidate stops looking like a
+#: company name and starts looking like a run of licence-file prose that leaked through.
 MAX_NAME_CHARS = 120
 
 _MAX_FILES_SCANNED = 600
@@ -87,9 +84,9 @@ _MAX_LICENCE_BYTES = 65_536
 _MAX_MANIFEST_BYTES = 262_144
 _MAX_README_BYTES = 40_960
 
-#: A copyright entity has to REPEAT before it counts. One file's header is as likely to be
-#: a single copied-in file's author as it is to be this repository's owner, and "strong
-#: because it repeats" is the only reason this family is worth reading at all.
+#: A copyright name earns nothing from a single appearance. One file carrying a header could
+#: just as easily be a vendored file's own author as the owner of this repository, so this
+#: family is only trustworthy once the same name recurs across more than one file.
 _MIN_COPYRIGHT_FILES = 2
 
 #: Two keyword hits, not one. One industry word in a README is a coincidence.
@@ -101,10 +98,11 @@ _LETTER_RE = re.compile(rf"[{vocab.COMPANY_NAME_LETTERS}]")
 #: the letter class running past ASCII so an accented legal entity keys to itself.
 _NOT_ALNUM_RE = re.compile(r"[^0-9A-Za-zÀ-ÿ]+")
 
-#: Where a name stops and the sentence around it begins. `*/` and `-->` earn their place
-#: beside the sentence punctuation: a C, Java, JS or HTML header closes its comment on the
-#: same line, and "Acme Systems */" is refused by the name pattern outright -- so leaving
-#: the terminator in loses the signal entirely rather than trimming it.
+#: Marks the boundary between a candidate name and whatever prose follows it. `*/` and
+#: `-->` are included alongside ordinary sentence punctuation because a comment in C, Java,
+#: JS or HTML often closes on the very same line as the name, and the name pattern rejects
+#: a trailing `*/` outright -- without stripping that terminator first, the whole name would
+#: be lost rather than merely trimmed.
 _NAME_ENDS_RE = re.compile(r"\s*\*/|\s*-->|\s*[;:<(\[]|\s+-\s+|\s{2,}")
 #: A full stop ends a name only when prose follows it. `Inc.` and `Ltd.` end in one, so
 #: splitting on the dot itself would turn every incorporated company into an
@@ -126,19 +124,22 @@ _GEM_RE = re.compile(r"^\s*gem\s+['\"]([^'\"]+)", re.MULTILINE)
 
 
 def is_emittable_name(text: object) -> bool:
-    """Whether `text` is a company name this tool may say out loud.
+    """Decide whether `text` is shaped like a company name safe enough to output.
 
-    The single gate. `collect` calls it on every candidate before returning one, and
-    `schema.COMPANY_NAME` applies the same pattern again at the write boundary as the
-    backstop. Anything refused here is DROPPED, never repaired: a half-cleaned name is a
-    company that does not exist.
+    `collect` runs every candidate through this before it can be returned, and
+    `schema.COMPANY_NAME` repeats the same check independently at the point where the
+    document is actually written, as a second line of defence. A candidate this rejects is
+    simply thrown away -- there is no attempt to clean it up and retry, because a name with
+    the suspicious part edited out is no longer a name anyone confirmed.
 
-    What the pattern refuses is what must not ride out wearing a name -- a filesystem path
-    (`/`, `\\`), an address or handle (`@`), a URL or host:port (`:`), a snake_case
-    identifier (`_`) -- and the rule doing most of the work is that a dot may END a word
-    but may never JOIN two characters, which refuses `acme.com`, `com.acme.payments` and
-    `payments_core.py` in one stroke. `U.S. Steel` is the honest casualty: a name we cannot
-    spell is a name the human types in the confirm step instead.
+    The pattern exists to keep other kinds of string from being mistaken for a name: a
+    filesystem path (`/` or `\\`), an email or handle (`@`), a URL or a `host:port` pair
+    (`:`), a snake_case identifier (`_`) are all rejected outright. The rule that catches the
+    most cases is about periods: one may sit at the end of a word (as in an abbreviation)
+    but may never sit between two letters joining them, which is what rejects `acme.com`,
+    `com.acme.payments` and `payments_core.py` all at once. The cost of that rule is real
+    names like `U.S. Steel`, which this function will not pass -- a name it cannot represent
+    safely is left for a person to type in by hand instead.
     """
     return (
         isinstance(text, str)
@@ -245,9 +246,9 @@ def _entity_from_copyright_line(text: str) -> str | None:
     entity = entity.strip().strip(",").strip()
     if not entity:
         return None
-    # "Copyright (c) 2024" with nothing after it leaves the year behind once the optional
-    # year run has nothing to hand the rest of the line to. A company called 2024 is
-    # precisely the bad guess this must never make, so an entity has to contain a letter.
+    # A notice like "Copyright (c) 2024" with no name after it leaves just the year as the
+    # candidate once the optional year group has nothing further to consume. Treating a bare
+    # year as a company name would be an obviously wrong guess, so a letter is required.
     if not _LETTER_RE.search(entity):
         return None
     if normalise(entity) in vocab.NOT_A_COMPANY:
@@ -396,10 +397,10 @@ def _from_pom(pom: str) -> list[str]:
         if org:
             names.append(org)
 
-    # EVERY `<organization>`, not only the first. A string-valued one -- a person's
-    # employer, in a block this does not strip -- has no `<name>` child, and stopping at it
-    # would drop the project's real organisation silently, which is worse than reading the
-    # wrong one because nothing downstream could tell the signal had been lost.
+    # Every `<organization>` element is visited, not just the first match. Some entries are
+    # a bare string rather than a `<name>` child -- typically a developer's own employer, in
+    # a section this parser leaves untouched -- and stopping at the first one risks missing
+    # the project's actual organisation with no trace that anything was skipped.
     for element in _ORGANISATION_RE.finditer(stripped):
         organisation = _ORG_NAME_RE.search(element.group(1))
         if organisation:
@@ -449,10 +450,11 @@ def _json(path: Path) -> object:
 # ---------------------------------------------------------------------------
 # Industry
 #
-# A hint for whoever sorts the catalogue, which has nothing else that supplies it.
-# Deterministic keyword matching over the README and the declared dependencies -- no model
-# call -- and nothing read out of the repository is emitted: the answer is one of OUR words
-# from `vocab.INDUSTRIES`, or nothing at all.
+# Nothing else in this tool tries to say what business a repository serves, so this fills
+# that one gap with plain keyword matching against the README text and the declared
+# dependency names -- no model, no external call. The field's value is always drawn from
+# this tool's own `vocab.INDUSTRIES` list, or left empty; no text copied from the
+# repository is ever written out under it.
 # ---------------------------------------------------------------------------
 
 

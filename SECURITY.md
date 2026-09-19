@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please report security issues privately to **msandeep85@gmail.com**. Do not open a
+Please report security issues privately to **partners@hazinalabs.com**. Do not open a
 public issue for a suspected vulnerability.
 
 Include, where you can:
@@ -33,15 +33,32 @@ against what the tool is actually meant to do.
 
 - It reads: your working tree, dependency manifests, CI configuration files, and your
   git history, through read-only `git` commands with fixed argument lists.
-- It executes **only `git`** in this release. There is no build check in this release —
-  `--no-build` is required on every command. A later release adds an **opt-in** build
-  check that, only when a user asks for it on a given run, installs the project's own
-  dependencies and runs the project's own build and test commands. That check does not
-  exist in this release; nothing your project's own tooling would run is executed here.
-- It writes only to the output directory you specify (`--out`, default `./hazina-out`).
-  It never writes inside the repository being measured.
-- It opens no network connection. There is no telemetry, no crash reporting, no version
-  check, no upload of any kind.
+- It executes `git`, always, read-only and with fixed argument lists.
+- **It also executes your project's own commands, by default.** The build check
+  (`--build full`, the default; `--build discover` for less; `--no-build` for none)
+  installs the dependencies your manifests declare, runs your build, lists your tests and
+  runs them. Those commands come from the repository being measured, so a hostile
+  repository is executing code on your machine — treat it the way you would treat running
+  `npm install` or `pip install -e .` in that checkout yourself, and use a disposable
+  clone. What bounds it: an empty throwaway `HOME` and a private `TMPDIR`, `CI=1`, a
+  `PATH` with your own directories removed, no credentials, no proxy settings and no agent
+  socket; argument lists rather than a shell; a process group per command, killed whole
+  when it overruns; one enforced time budget for the whole repository; and a snapshot of
+  the checkout taken before anything runs and restored afterwards. The restoration is best
+  effort. It is not a sandbox and does not claim to be one. **What is not bounded in this
+  release:** a command's stdout and stderr are captured in full and are not size-limited,
+  so a command that writes an unusually large amount of output is read to completion
+  rather than truncated.
+- `--no-build` switches all of that off, and then `git` is the only thing executed.
+- It writes its OUTPUT only to the directory you specify (`--out`, default
+  `./hazina-out`), never inside the repository being measured. The build check is the one
+  exception to "nothing is written in your tree", and it writes there only what the
+  project's own install and build commands write: lockfiles, dependency directories, build
+  output. Those are snapshotted first and put back afterwards.
+- **This tool** opens no network connection: no telemetry, no crash reporting, no version
+  check, no upload of any kind. Your project's own package manager, run by the build
+  check, reaches whatever index your manifests point it at — that is its traffic, not
+  ours, and `--no-build` means none of it happens.
 - It never collects: author names or email addresses, commit messages, branch or tag
   names, file or directory paths, environment-variable names, or credentials, keys,
   tokens or passwords. See the README for the full list of what is, and is not,

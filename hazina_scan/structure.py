@@ -1,48 +1,53 @@
-"""Where the complexity in a repository sits, and how much of it there is.
+"""Measure where a codebase's structural complexity concentrates and how big it is.
 
-Three things come out of this module, and only the first of them is the reason it exists.
+Three figures come out of this module. Only the first is the actual reason it exists; the
+other two exist to put the first one in context.
 
-*How concentrated the decisions are.* `decisions_gini_top1pct` is the share of every branch,
-loop and guarded path in the tree that sits in its densest one percent of functions. It is
-the one structural figure here that does not move with size: a twenty-thousand-line service
-and a two-thousand-line library can score identically, and what separates them -- complexity
-gathered into a few real modules against complexity smeared evenly over many shallow files
--- is invisible to every count of lines or files. Attributing a decision to a function needs
-real function boundaries, which is the whole reason a parser is a dependency here instead of
-a regular expression.
+*Concentration.* `decisions_gini_top1pct` asks what fraction of every branch, loop and
+guard clause in the tree lives inside its busiest one percent of functions. It is the one
+number here that stays comparable regardless of codebase size: a small library and a huge
+service can land on the same figure, because it measures whether complexity is piled into a
+handful of modules or spread thinly across many, and that distinction disappears if you
+only count lines or files. Doing this at all requires knowing where each function actually
+starts and ends, which is exactly why this module depends on a real parser instead of a
+regular expression over the text.
 
-*How much the code says about its own failure modes.* `error_handling_per_kloc` counts
-try/catch/Result density in production code. The limit of that measurement is worth stating
-plainly rather than hiding: it is lexical, so it fires inside comments and string literals,
-and it cannot see failure handling a language expresses in its types rather than its words.
-Rust's `?`, Haskell's ExceptT and an OCaml `option` return are all undercounted here and no
-keyword list can fix it.
+*Self-reported failure handling.* `error_handling_per_kloc` counts how often
+try/catch/Result-style constructs appear per thousand lines of production code. Its honest
+limitation: this is a lexical count, so it fires just as readily inside a comment or a
+string as inside real code, and it has no way to see error handling a language expresses
+through its type system rather than its keywords -- Rust's `?` operator, Haskell's
+ExceptT, an OCaml `option` return all fall outside what a keyword scan can see, and no
+amount of tuning the keyword list changes that.
 
-*How much code there is.* `prod_loc` and `source_files` are size controls. Nothing is scored
-on them directly; they exist so the two figures above can be read in proportion.
+*Raw size.* `prod_loc` and `source_files` do not score anything on their own; they exist
+purely so the two figures above can be read relative to how much code there actually is.
 
-Three rules run through all of it.
+Three rules apply throughout the module:
 
-*Unmeasured is never zero.* If the parser is not installed, nothing is measured and the
-block says so -- a missing grammar is a fact about the operator's machine, not a property of
-the repository, and reporting it as a structural score of zero would be a lie about somebody
-else's code. The same rule applies inside a successful scan: a tree in which no function was
-parsed gets a null concentration figure and a note, not a zero.
+*An unmeasured repository never scores as zero.* If the parser package is not installed,
+the block reports that and stops there -- a missing grammar is a fact about this machine,
+not about the repository being scanned, and scoring it as zero would misrepresent someone
+else's code. The same holds within an otherwise successful scan: a tree where no function
+actually got parsed comes back with a null concentration figure and an explanatory note,
+never a bare zero.
 
-*Bounds are reported, never applied silently.* A capped walk, a skipped file, a grammar that
-would not load -- each of them is counted and said out loud in `bounds`, because a truncated
-scan that looks complete is worse than one that admits what it missed.
+*Every limit hit is reported, never silently absorbed.* A walk that hit its cap, a file
+that was skipped, a grammar that failed to load -- each is counted and surfaced through
+`bounds`, because a scan that looks complete while quietly having skipped things is worse
+than one that says plainly what it did not cover.
 
-*Nothing about the tree leaves except counts.* No path, no filename, no fragment of source.
-`bounds` and `note` are numbers and plain words.
+*Only counts leave this module, nothing else about the tree.* No path, no filename, no
+snippet of source code -- `bounds` and `note` are strictly numbers and generic prose.
 
-Language coverage is in two layers, and the second one exists because of the first rule.
-Extensions the pinned parser pack can parse are counted and attributed. Real languages the
-pack has no grammar for are counted and never parsed, and reported separately as
-`source_files_unparsed` so a reader can see how much of the tree the concentration figure
-was actually computed over. A language absent from both tables does not make its repository
-score badly -- it makes the repository look empty, which is a gap in our table wearing the
-costume of a verdict about somebody's work.
+Language coverage has two layers because of the "never zero" rule above. Files in languages
+the bundled parser grammars support are parsed and counted toward the concentration figure.
+Files in real languages the grammar pack does not cover are still counted, just never
+parsed, and reported under a separate `source_files_unparsed` total so a reader can tell how
+much of the tree the concentration figure was actually derived from. A language this module
+has never heard of at all does not drag a repository's score down -- it just makes that
+slice of the repository look like it has no code, which is a gap in this module's coverage
+rather than a verdict on the repository.
 """
 
 from __future__ import annotations
@@ -64,11 +69,12 @@ MAX_FILES = 2500
 MAX_BYTES = 1_000_000
 
 
-# --- extensions that belong to more than one living language --------------------------------
+# --- extensions shared by more than one language still in active use -------------------------
 #
-# Choosing wrong costs the file its attribution while still counting its lines, so each of
-# these reads the file's own bytes. The fallback is whichever reading is commoner in real
-# repositories.
+# Getting the wrong language here still counts the file's lines, just against the wrong
+# total, so each of these functions actually inspects the file's bytes rather than trusting
+# the extension alone. When the content is inconclusive, the fallback picks whichever of the
+# two languages turns up more often in practice.
 
 
 def resolve_m(data: bytes) -> str:
@@ -134,7 +140,7 @@ def notebook_source(data: bytes) -> bytes:
 
 
 def gini_top(values: list[int], frac: float = 0.01) -> float:
-    """The share of all decision points held by the densest `frac` of functions."""
+    """Return what fraction of the total decision count sits in the top `frac` of `values`."""
     if not values:
         return 0.0
     total = sum(values)
@@ -145,22 +151,27 @@ def gini_top(values: list[int], frac: float = 0.01) -> float:
 
 
 def decisions_per_function(tree, data_len: int, lang: str = "") -> list[int]:
-    """One decision count per function in a parse tree. Walked iteratively, because a
-    generated file nests deeply enough to exhaust a recursive walk's stack.
+    """Return one decision-node count per function found while walking `tree`.
 
-    Two corrections keep the distribution honest across grammars that spell the same
-    construct more than once, and both are structural rather than a list of names.
+    The walk uses an explicit stack rather than call recursion, since a large or
+    machine-generated source file can nest past what the interpreter's own call stack would
+    tolerate otherwise.
 
-      * Nothing without children can be a function. Several grammars expose the KEYWORD as a named
-        node -- Python's `def`, PHP's and Lua's `function`, Ada's `procedure` -- and those
-        names have to stay in the table because in Lean, Haskell and Odin the same spelling
-        IS the definition. Requiring children tells the two apart without a per-language
-        exception.
-      * A wrapper that scores zero only because a nested function took all of its decisions
-        is a phantom rather than a function. Counting it would open one empty function per
-        real one, which halves every density and moves the top share for a reason that is
-        grammar bookkeeping rather than code. A function with genuinely zero decisions and
-        no function inside it is real, and is kept: straight-line code is a true data point.
+    Each node's grammar type decides how it is treated, with one adjustment: when `heads` is
+    set for this language (Elixir, where `def` and `if` both parse as an ordinary call), the
+    leading word of a call node's first child is checked against the configured keyword lists
+    and can relabel the node as a function definition or an if-statement. A node with no
+    children is never counted as a function, because several grammars reuse the definition
+    keyword as a bare named node -- Python's `def`, PHP's and Lua's `function`, Ada's
+    `procedure` -- even though in Lean, Haskell or Odin that identical spelling already is the
+    whole definition; requiring at least one child separates the two cases without hard-coding
+    a list of languages.
+
+    Entering a function opens a new counter keyed by its byte span and, if another function
+    was already open, marks that outer one as a wrapper. Every decision node instead adds one
+    to whichever function currently encloses it. A function is dropped from the result only
+    when it is marked as a wrapper and its own count came to zero; a function that legitimately
+    has no decisions and contains no nested function is kept, because that count is real.
     """
     counts: dict[int, int] = {}
     wraps: set[int] = set()  # keys of functions that contain another function
@@ -225,10 +236,11 @@ def collect(repo: Path) -> dict:
                 break
             if not path.is_file() or path.is_symlink():
                 continue
-            # as_posix, not str: rglob yields backslash separators on Windows and every
-            # pattern below anchors on `/`. Matching the native separator would make them
-            # silently never fire there -- a vendored tree counted as first-party code and
-            # a test file as production, on that platform only, with no error to show.
+            # `as_posix()` rather than `str()` here: on Windows, `rglob` returns paths with
+            # backslash separators, but every skip pattern below is written against `/`.
+            # Using the native separator on that platform would make the patterns never
+            # match at all, with no error raised -- a vendored directory or a test file
+            # would silently get counted as production code, only on Windows.
             rel = path.relative_to(repo).as_posix()
             if vocab.STRUCTURE_SKIP_DIR.search(rel) or vocab.STRUCTURE_SKIP_FILE.search(rel):
                 continue

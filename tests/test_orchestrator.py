@@ -5,6 +5,31 @@ import time
 import pytest
 
 from hazina_scan import orchestrator as orc
+from hazina_scan.build import discover, ecosystems
+
+# The build lane is exercised here through the same made-up ecosystems `tests/test_build_probe`
+# uses, so a measurement that installs and tests a project can be run on a machine with no
+# toolchain on it at all. Each fixture project's manifest is a small JSON document naming one
+# of that module's stand-in scripts per phase.
+from tests.test_build_probe import FAKE, MANIFEST, _planner
+
+
+@pytest.fixture
+def fake_ecosystems(monkeypatch):
+    """Teach discovery and the planner registry about the ecosystems used in this file.
+
+    Deliberately narrower than the namesake in `tests/test_build_probe`: that one also keeps
+    the per-project evidence on the block so its assertions can read the phase records, and
+    the evidence is exactly what `collect()` drops before anybody sees it. Keeping it here
+    would put an undeclared key through the write boundary and stop the run.
+    """
+    monkeypatch.setattr(
+        discover,
+        "_MARKERS",
+        discover._MARKERS + tuple((eco, (MANIFEST[eco],)) for eco in FAKE),
+    )
+    for eco in FAKE:
+        monkeypatch.setitem(ecosystems.PLANNERS, eco, _planner)
 
 
 def test_repo_full_name_parsing(monkeypatch):
@@ -45,9 +70,124 @@ def test_row_status_is_measured_without_a_build():
     assert orc.row_status({"build_skipped": True}) == ("partial", "lanes_timed_out")
 
 
-def test_other_build_levels_are_refused(py_repo):
-    with pytest.raises(NotImplementedError):
-        orc.measure(py_repo, build_level="full")
+def test_a_level_nobody_declared_is_refused(py_repo):
+    with pytest.raises(ValueError):
+        orc.measure(py_repo, build_level="everything")
+
+
+# --------------------------------------------------------------------------
+# The build lane, driven by projects in an ecosystem that does not exist
+# --------------------------------------------------------------------------
+
+
+def _buildable(repo_builder, spec: dict, name: str = "repo"):
+    """A one-commit repository holding one project the fake planner knows how to run."""
+    return repo_builder({MANIFEST[FAKE[0]]: json.dumps(spec), "source.txt": "x" * 32}, name=name)
+
+
+def test_a_discover_level_run_fills_in_the_build_block(fake_ecosystems, repo_builder):
+    repo = _buildable(repo_builder, {"install": "ok", "build": "ok", "discover": "collect3"})
+    row, measurement = orc.measure(repo, build_level="discover", timeout_build=30, build_budget=120)
+
+    block = measurement["ext_signals"]["build"]
+    assert block is not None
+    assert block["probe"] == "build"
+    assert block["build_level"] == "discover"
+    assert block["build_level_requested"] == "discover"
+    assert block["build_ok"] is True
+    assert block["install_ok"] is True
+    assert block["tests_discovered"] is True
+    assert block["discover_runnability"] == 3
+    # The row carries the same two verdicts, and the suite one is absent at this level.
+    assert row["build_ok"] is True
+    assert row["testable_at_head"] is None
+    assert row["status"] == "measured"
+
+
+def test_the_build_lane_has_the_tree_to_itself(fake_ecosystems, repo_builder):
+    """The exclusivity rule, read off the recorded spans rather than off the control flow."""
+    repo = _buildable(repo_builder, {"install": "ok", "discover": "collect3"})
+    clock = orc.LaneClock()
+    orc.measure(repo, build_level="discover", clock=clock, timeout_build=30, build_budget=120)
+
+    assert clock.seconds("build") is not None  # the lane really ran
+    assert clock.overlaps("build") == []
+    # And the readers still overlapped each other, so the emptiness above is not an artefact
+    # of everything having been serialised.
+    assert clock.overlaps("tree") != []
+
+
+def test_a_probe_the_clock_never_reached_makes_the_row_partial(fake_ecosystems, repo_builder):
+    repo = _buildable(repo_builder, {"install": "ok"})
+    # Under the smallest phase a probe will start, so however fast the readers are there is
+    # nothing left to start one with.
+    budget = orc.build_probe.MIN_PHASE_SECONDS - 1
+    row, measurement = orc.measure(repo, build_level="discover", deadline=orc.Deadline(budget))
+    # Nothing is left for the lane that executes, so it is recorded as skipped rather than
+    # run: every runnability field is null and the row says the run has a hole in it.
+    block = measurement["ext_signals"]["build"]
+    assert block["build_skipped"] is True
+    # The stub carries no measurement at all rather than a false one, so there is no
+    # `build_ok` on the block to read and the row's column is null.
+    assert "build_ok" not in block
+    assert "seconds left" in block["note"]
+    assert row["build_ok"] is None
+    assert (row["status"], row["skip_reason"]) == ("partial", "lanes_timed_out")
+
+
+def test_a_full_attempt_that_runs_out_is_finished_at_the_cheaper_level(
+    fake_ecosystems, repo_builder, capsys
+):
+    """The fallback. The suite cannot finish, so the measurement is completed at `discover`
+    and both levels are recorded -- the one that ran and the one that was asked for.
+
+    TWO roots, not one. The fallback fires only when the check's own clock stopped it, and
+    what proves that is a root the clock never reached; a single root that merely hangs uses
+    up the allowance without ever leaving one unvisited.
+    """
+    repo = _buildable(repo_builder, {"install": "hang"})
+    second = repo / "part2"
+    second.mkdir()
+    (second / MANIFEST[FAKE[1]]).write_text(json.dumps({"install": "hang"}))
+    (second / "source.txt").write_text("x" * 32)
+    started = time.monotonic()
+    row, measurement = orc.measure(
+        repo,
+        build_level="full",
+        build_budget=36,
+        full_attempt_seconds=16,
+        timeout_build=900,
+        deadline=orc.Deadline(300),
+    )
+    elapsed = time.monotonic() - started
+
+    block = measurement["ext_signals"]["build"]
+    assert block["build_level"] == "discover"
+    assert block["build_level_requested"] == "full"
+    assert "cheaper level" in block["build_level_fallback_reason"]
+    assert block["run_budget_exhausted"] is True
+    assert row["build_ok"] is None
+    # Both calls together stayed inside the reserve they were given.
+    assert elapsed < 36 + 25, f"the two attempts overran the build reserve: {elapsed:.1f}s"
+    assert "ran at level discover (asked for full)" in capsys.readouterr().err
+
+
+def test_a_twenty_second_budget_stops_the_run_and_reports_nulls(fake_ecosystems, repo_builder):
+    """The budget is enforced, not recorded. Nothing here can finish, so the only thing that
+    can end the run is the clock -- and what it did not reach is null with a reason."""
+    repo = _buildable(repo_builder, {"install": "hang"})
+    started = time.monotonic()
+    row, measurement = orc.measure(repo, build_level="full", deadline=orc.Deadline(20))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 35, f"the run overran its budget by {elapsed - 20:.1f}s"
+    block = measurement["ext_signals"]["build"]
+    assert block["build_ok"] is None
+    assert block["observed_runnability"] is None
+    assert block["observed_runnability_reason"]
+    assert block["timed_out"] is True
+    assert row["build_ok"] is None and row["testable_at_head"] is None
+    assert (row["status"], row["skip_reason"]) == ("partial", "lanes_timed_out")
 
 
 def test_measure_writes_three_files(py_repo, tmp_path):

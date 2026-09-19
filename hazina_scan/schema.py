@@ -1,35 +1,38 @@
-"""The write boundary. Nothing reaches an output file without passing through here.
+"""Everything that can end up in an output file has to be validated by code in this module.
 
-Two documents leave this tool: a `codebase_repos` row and a `measurement`. Every leaf of
-both is declared below with the *kind of thing* it is allowed to be -- a number, a boolean,
-a member of a closed vocabulary, a bounded token, one of this tool's own status notes, or
-nothing at all. A key that is not declared does not get scrubbed, truncated or written with
-a warning: `enforce` raises and the run stops before a byte is written.
+This tool produces two documents, a `codebase_repos` row and a `measurement`, and every leaf
+either one can hold is declared here together with the one *kind* of value it is permitted
+to be: a plain number or boolean, a value from a closed vocabulary, a bounded token, a status
+note written in this tool's own words, or a field that is always empty. Anything not on that
+list is not sanitised, shortened or passed through with a note attached -- `enforce` raises
+and nothing gets written, full stop.
 
-That is the difference between a denylist and an allowlist, and it is the whole point of
-the module. A denylist answers "is this one of the things we thought of", which means every
-field a collector grows next month ships by default. Here the default is refusal, so
-growing a field is a deliberate edit to this file.
+This is an allowlist rather than a denylist by design, and the distinction matters. A
+denylist only rejects what somebody thought to reject, so any field a future collector
+happens to add ships automatically. Here the starting position is rejection, so adding a new
+field means someone has to come to this file and declare it on purpose.
 
-The kinds, in one paragraph:
+The five kinds this module recognises:
 
-* **numbers and booleans** -- counts, ratios and flags, which carry nothing from the tree.
-* **closed-vocabulary values** -- a language, a framework, a linter. Checked against
-  `vocab.py`, which holds our own tables of public technology names. A value outside the
-  table is either folded to `"other"` or refused; it is never emitted, because a string
-  that is not in our table is a string from somebody's repository.
-* **tokens** -- the content digest, the display handle, a timestamp, a version, and the two
-  declared names (the repository's own and the company it belongs to). Each bounded by a
-  pattern narrow enough that something else cannot ride through wearing its shape: an
-  absolute path cannot pass as a repository name.
-* **our own notes** -- short status prose that this tool wrote, from this tool's own
-  vocabulary. Held to the same rule as any other prose, with our flag names and enum
-  literals neutralised first so they do not read as identifiers from the tree.
-* **not collected** -- declared, permanently empty, and visible as such in `review()`. A
-  reader is entitled to see what was considered and refused, not left to infer it from a
-  field that is simply absent.
+* **numbers and booleans** -- plain counts, ratios and flags; nothing from inside the tree
+  passes through as one of these.
+* **closed-vocabulary values** -- things like a language or a framework name, checked
+  against the tables of public technology names in `vocab.py`. Anything not already in that
+  table is either mapped to `"other"` or dropped, because an unrecognised string here is, by
+  definition, text that came from somebody's repository rather than from this tool.
+* **tokens** -- short bounded strings such as the content digest, the display handle, a
+  timestamp or version string, and the two name fields (the repository's own name and its
+  company). Each has a pattern tight enough that nothing of a different shape, such as an
+  absolute filesystem path, can be mistaken for it.
+* **status notes** -- short prose this tool wrote about its own run, drawn from its own
+  vocabulary of flag names and enum values, which get masked out first so they cannot look
+  like identifiers pulled from the repository. These are subject to the same prose rules as
+  everything else emitted in free text.
+* **declared-empty fields** -- fields that are permanently unset and say so in `review()`,
+  so a reader can see what this tool chose not to collect rather than guessing at why a key
+  is missing.
 
-`enforce` returns a NEW document. It never mutates what it was handed.
+`enforce` never modifies the document it is given; it always builds and returns a new one.
 """
 
 from __future__ import annotations
@@ -86,10 +89,12 @@ _REJECTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b[A-Z]{2,}[A-Z0-9]*\b"), "it holds an acronym or a constant name"),
 ]
 
-# Round brackets are refused in text we did not write and allowed in text we did. Whatever
-# could hide inside a parenthesis is caught by the rules above; our own status notes are
-# parenthetical by habit, and refusing every one of them would leave a failed check with no
-# explanation beside it at all.
+# `rejection_reason` only applies this pattern when `allow` is empty, i.e. for text nothing in
+# this codebase vouches for. Parenthetical asides are routine in the notes this tool writes for
+# itself -- a failed-check message naming the disabled flag is a typical example -- so banning
+# parentheses unconditionally would make this tool unable to describe its own output. Whatever
+# a parenthetical aside might otherwise smuggle past the schema is still caught by the patterns
+# listed above it, which run regardless of where `allow` came from.
 _ROUND_BRACKETS = (re.compile(r"[()]"), "it holds code punctuation")
 
 _WORD = re.compile(r"[A-Za-z][A-Za-z'’-]*")
@@ -98,17 +103,20 @@ _WORD = re.compile(r"[A-Za-z][A-Za-z'’-]*")
 def rejection_reason(
     text: str, max_words: int = MAX_SENTENCE_WORDS, allow: frozenset[str] = frozenset()
 ) -> str | None:
-    """Why this line of prose may not leave, or None when it may.
+    """Return why `text` cannot go out as free-form prose, or `None` if the schema accepts it.
 
-    A note is allowed to say what SHAPE something has. It is not allowed to name a file, a
-    path, a symbol, a product or a company: a line that names one of those describes the
-    repository rather than the engineering, and the repository is not ours to describe.
+    The words in `allow` -- this tool's own flag names and the literal members of its closed
+    vocabularies -- are stripped out of `text` first, via `_neutralise`, so a note this tool
+    wrote itself, such as "check skipped (mine_disabled)", is not rejected merely for
+    containing one of its own snake_case identifiers. A non-empty `allow` also marks `text` as
+    something this tool generated rather than copied out of a repository, which is why it also
+    relaxes the parenthesis rule below.
 
-    `allow` is this tool's own vocabulary -- the flag names and enum literals our own notes
-    are written from. Those tokens are neutralised before the patterns run, so a note
-    reading "check skipped (mine_disabled)" is not thrown out for holding a snake_case
-    identifier that we ourselves wrote. Passing a non-empty `allow` is also what marks the
-    text as ours, which is what relaxes the round-bracket rule.
+    What the remaining patterns reject, underneath that allowance, is anything specific enough
+    to be describing someone's repository rather than describing this tool's own behaviour: a
+    path, a file, a symbol out of somebody's source, a product name, a company name. A note is
+    free to state a shape or an outcome in general terms, but never to name the particular
+    thing it was drawn from.
     """
     if not isinstance(text, str) or not text.strip():
         return "it is empty"
@@ -155,11 +163,11 @@ def _capitalised_name_in(probe: str) -> str | None:
     return None
 
 
-# The words this tool writes its own notes with: its flag names, the literals of its own
-# closed vocabularies, and the exception class names a collector interpolates with
-# `type(e).__name__`. Those last ones are the Python runtime's vocabulary rather than the
-# repository's, and without them a note reading "parser unavailable (ImportError)" is
-# dropped and a support question has no answer left in the artifact.
+# The vocabulary this tool's own status notes are allowed to be written from: its flag
+# names, the values of its closed vocabularies, and the exception class names a collector
+# interpolates via `type(e).__name__`. That last group belongs to the Python runtime, not to
+# the repository being scanned, and excluding it would mean a note like "parser unavailable
+# (ImportError)" gets rejected, leaving an operator with no clue what actually happened.
 OWN_WORDS = frozenset(
     {
         "--no-build",
@@ -472,10 +480,11 @@ MODEL_ID = Token("tool id", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,80}")
 REPO_FULL_NAME = Token(
     "repository name", r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99}){0,3}"
 )
-# The name of a company that is not the operator: the second deliberate exception to the
-# identity rule, and the only field that names a third party. Bounded the same way
-# REPO_FULL_NAME is; `vocab.COMPANY_NAME_PATTERN` carries the reasoning for each character
-# it refuses. A token accepts None, which is the honest value when the tree named nobody.
+# A third party's name -- specifically the company that owns the repository, as opposed to
+# the operator running this tool. This is the second deliberate carve-out from the general
+# no-identity rule, bounded with the same token pattern used for REPO_FULL_NAME; see
+# `vocab.COMPANY_NAME_PATTERN` for why each excluded character is excluded. `None` is a
+# valid value here, standing for a checkout that gave no evidence of who owns it.
 COMPANY_NAME = Token("company name", vocab.COMPANY_NAME_PATTERN)
 
 
@@ -751,16 +760,101 @@ _HISTORY = Object(
     }
 )
 
-# Which COMPANY the repository belongs to. The one block that names a third party, so its
-# shape is deliberately narrow: a short candidate list, the signal families behind each
-# name, one outcome, and an industry drawn from our own vocabulary.
+# What happened when this repository's own install, build and test commands were run. The
+# block is wide because the question it answers splits three ways and a reader has to be able
+# to tell the three apart: what the repository did, what this machine could not offer it, and
+# what the clock never reached. Every verdict therefore arrives with the reason beside it.
 #
-# The absence of any figure here is deliberate and not something that was overlooked.
-# Repeated copyright headers do get tallied, because that is how recurrence is established,
-# but the tallies go no further than the function that produced them. A hit count attached
-# to a name is a confidence score in disguise, and a confidence score printed next to a
-# company reads as a mark out of ten. Naming the families supplies all the provenance
-# anybody needs: found in your licence file and in your git remote.
+# Nothing here carries a command line, a package name, a path or a log line. The commands are
+# declared and permanently empty (`build_commands_tried`), because which install hook a tree
+# runs is a fact about the tree that scoring it never needed.
+_BUILD_LEVEL = Enum("build level", {"none", "discover", "full"})
+
+_BUILD = Object(
+    {
+        "probe": Enum("probe name", {"build"}),
+        "ok": BOOL,
+        "error": OWN_PROSE,
+        "note": OWN_PROSE,
+        "build_skipped": BOOL,
+        # The level that RAN and the level that was ASKED FOR, as a pair. One field cannot
+        # carry both facts, and without the second a cheaper check somebody chose looks
+        # identical to an expensive one the budget cut short -- which is the case that leaves
+        # the executed index unscored and is the one an operator can fix by raising a number.
+        "build_level": _BUILD_LEVEL,
+        "build_level_requested": _BUILD_LEVEL,
+        "build_level_fallback_reason": OWN_PROSE,
+        "run_budget_exhausted": BOOL,
+        "build_probe_mode": Enum("probe mode", {"deterministic", "agentic"}),
+        "build_probe_model": MODEL_ID,
+        "agentic_fallback_reason": OWN_PROSE,
+        "toolchain": Enum("toolchain", vocab.TOOLCHAINS, unknown="other"),
+        "build_attempted": BOOL,
+        "build_commands_tried": NOT_COLLECTED([], _NO_COMMANDS),
+        "install_ok": BOOL,
+        "build_ok": BOOL,
+        # The executed score, 0 to 4: the build worked, the suite ran, something passed,
+        # coverage came back above nothing. A small integer with no detail in it, and the only
+        # number in this document earned by running the project rather than reading its files.
+        "observed_runnability": NUMBER,
+        # Why that score is absent, and whose absence it is. A null with no reason beside it
+        # is what a reader marks a repository down for.
+        "observed_runnability_reason": OWN_PROSE,
+        # Its companion at the cheaper level, 0 to 3: dependencies resolved, the build
+        # succeeded, tests were found. Every term executed and none of them needing a suite,
+        # which is what keeps a run that fell back gradeable.
+        "discover_runnability": NUMBER,
+        "tests_discovered": BOOL,
+        "build_and_tests_ran": BOOL,
+        "failure_class": Enum(
+            "failure class",
+            {"NONE", "REPO_INTRINSIC", "ENVIRONMENT", "TIMEOUT", "UNCLASSIFIED"},
+        ),
+        "repo_intrinsic_failure": BOOL,
+        "timed_out": BOOL,
+        "coverage_pct": NUMBER,
+        "coverage_method": OWN_PROSE,
+        "coverage_unsupported_reason": OWN_PROSE,
+        "build_remediation_effort": Enum(
+            "remediation effort",
+            {"none", "trivial", "moderate", "substantial", "infeasible", "unknown"},
+        ),
+        "build_remediation_notes": OWN_PROSE,
+        # THE INTERPRETER THIS TREE NAMED, AND THE ONE IT RAN ON. Without these five a reader
+        # cannot separate a repository that does not build from one this machine built with
+        # the wrong interpreter, and those call for opposite conclusions. The lanes come from
+        # our own table; the versions are version tokens, which is why a declared range is
+        # normalised to two numbers rather than emitted as the comparison the manifest wrote.
+        "runtime_lanes_declared": ListOf(Enum("runtime lane", vocab.RUNTIME_LANES)),
+        "runtime_lanes_unsatisfied": ListOf(Enum("runtime lane", vocab.RUNTIME_LANES)),
+        "runtime_requested": ListOf(VERSION),
+        "runtime_used": ListOf(VERSION),
+        "runtime_resolution_note": OWN_PROSE,
+        # A repair pass this tool does not offer. The fields ship so that "never offered" and
+        # "offered, and nothing needed it" stay distinguishable; a reader seeing neither field
+        # could not tell them apart, and they mean different things about the repository.
+        "repair_offered": BOOL,
+        "repair_candidates_n": NUMBER,
+        "repair_attempted_n": NUMBER,
+        "repair_succeeded_n": NUMBER,
+        "repair_refused_n": NUMBER,
+        "repair_rejected_source_edit_n": NUMBER,
+        "repair_seconds": NUMBER,
+    }
+)
+
+# Which company owns the repository -- the one place in this schema where a third-party
+# name is permitted, so its shape is kept deliberately small: a short list of candidate
+# names, which evidence families backed each one, a single chosen outcome, and an industry
+# guess drawn from this tool's own vocabulary.
+#
+# There is no confidence number anywhere in this block, and that is on purpose rather than
+# an oversight. `identity.py` does tally how many files repeat a given copyright header
+# internally, since recurrence is exactly what makes that evidence worth trusting, but the
+# tally itself never leaves that function. A count attached to a candidate name would be a
+# confidence score by another name, and a confidence score next to a company name reads like
+# a grade. Which evidence families support a name is already enough for a reader to judge
+# it -- "found in your licence file and your git remote" tells the whole story.
 _COMPANY_IDENTITY = Object(
     {
         "outcome": Enum("company inference outcome", vocab.COMPANY_OUTCOMES),
@@ -787,8 +881,9 @@ _MEASUREMENT = Object(
         # Here so a record can be matched to its repository, which the digest cannot do since
         # it identifies a set of file contents. A checkout without a remote yields null.
         "real_repo_name": REPO_FULL_NAME,
-        # Beside `real_repo_name` because it answers the other half of the same question: that
-        # field says WHICH repository, this one says WHOSE.
+        # Declared next to `real_repo_name` because together they answer one two-part
+        # question: that field identifies which repository this is, this one identifies
+        # who owns it.
         "company_identity": _COMPANY_IDENTITY,
         "variant": Enum("variant", {"ext"}),
         "capacity": NUMBER,
@@ -807,10 +902,8 @@ _MEASUREMENT = Object(
             {
                 "structure": _STRUCTURE,
                 "history": _HISTORY,
-                # Declared with no fields of its own yet: the build check is not implemented here,
-                # so the only value that can pass is None -- which is exactly what the collector
-                # hands over while the check is off. Filling this in is a deliberate edit.
-                "build": Object({}),
+                # None still passes, and is what a run with the check switched off writes.
+                "build": _BUILD,
             }
         ),
     }
@@ -880,11 +973,13 @@ SPEC: dict[str, Object] = {
 
 
 def enforce(document: str, payload: dict) -> dict:
-    """Return a new payload holding only what the declarations permit, or raise.
+    """Validate `payload` leaf by leaf against its declarations and return a fresh copy, or raise.
 
-    Every leaf is checked against its declared kind and every key against the declared
-    field names -- or, inside a dynamic map, against that map's closed vocabulary. Nothing
-    undeclared is scrubbed, truncated or let through with a warning: the run stops.
+    Each key must be one this module has declared -- or, for a dynamic map field, a key
+    drawn from that map's own closed vocabulary -- and each value must match its declared
+    kind. There is no partial handling of an undeclared or malformed field: it is never
+    quietly stripped, shortened or passed through with a warning, the call simply raises and
+    the caller has to stop rather than write a document with something unvetted inside it.
     """
     spec = SPEC.get(document)
     if spec is None:
@@ -933,11 +1028,12 @@ def _is_closed(kind: Kind) -> bool:
 
 
 def _closed_vocabulary_keys() -> frozenset[str]:
-    """Field names whose values are already known to come from a closed vocabulary.
+    """List the fields whose values were already validated against a fixed vocabulary table.
 
-    A later backstop scrub skips these. Running a regex over a value that was matched
-    against a fixed table cannot make it safer, and it does corrupt it: a scrub reads
-    "Next.js" as a filename and "GitHub Actions" as a class name.
+    A later pass that scrubs free text for anything path- or identifier-shaped is told to
+    leave these fields alone. Running that scrub over a value already checked against a
+    table adds no safety and actively breaks it -- it would mangle "Next.js" as though it
+    were a filename, or "GitHub Actions" as though it were a class name.
     """
     found: set[str] = set()
 
@@ -1002,11 +1098,12 @@ def _group_of(kind: Kind) -> str:
 
 
 def _withheld(kind: Kind, name: str, into: dict) -> None:
-    """Every declared field this tool refuses to fill in, and why.
+    """List every field this tool declares but never populates, with the reason for each.
 
-    Read off the declarations rather than off the payload: "we do not collect commit
-    messages" is a statement about the tool, and an operator should see it whether or not
-    this particular run happened to have somewhere to put one.
+    This reads the field declarations themselves, not any particular run's payload, because
+    a statement like "commit messages are never collected" is true of the tool as a whole
+    and should show up in the review regardless of whether this run's repository even had
+    commit messages to withhold.
     """
     if isinstance(kind, NotCollected):
         into.setdefault(name, kind.reason)
@@ -1059,13 +1156,15 @@ def _walk(kind: Kind, value, path: str, found: dict) -> None:
 
 
 def review(documents: dict[str, dict], full: bool = False) -> str:
-    """A plain-language account of what the output files hold. Nothing has been sent.
+    """Summarise, in plain language, what one or more validated documents contain.
 
-    `documents` maps a display name to a payload `enforce` has already passed. `full=True`
-    names every emitted field and its value, including the fields that ship empty.
-    `full=False` gives the per-kind counts, every line of free text verbatim, and the list
-    of things this tool does not collect -- which is the part most worth reading and the
-    part a field-by-field dump buries.
+    Nothing about calling this sends anything anywhere -- it only reads back what
+    `enforce` already produced. `documents` maps a display label to a payload that has
+    already passed `enforce`. With `full=True` the summary lists every field and its actual
+    value, empty ones included. With `full=False` it instead gives, per kind, how many
+    fields of each type were emitted, the text of every free-form note verbatim, and the
+    list of fields this tool never collects at all -- arguably the most useful part of the
+    review, and the part a raw field-by-field dump tends to bury.
     """
     found: dict[str, list] = {}
     withheld: dict[str, str] = {}

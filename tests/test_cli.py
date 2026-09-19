@@ -4,12 +4,14 @@ Every test here runs the module as a subprocess, because the exit code and the t
 streams ARE the interface -- calling `cli.main([...])` in-process would test the same
 function while skipping the part an operator actually uses.
 
-`--no-build` is passed everywhere: the build check is not in this release, and an
-invocation without it is refused (which is itself one of the tests below).
+`--no-build` is passed almost everywhere, because the check executes the measured
+repository's own install and test commands and none of the tests below are about that.
+The few that ARE about it say so, and ask for the cheaper level.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import zipfile
@@ -48,9 +50,45 @@ def test_single_repo(py_repo, tmp_path):
     assert "acme/demo" in proc.stdout and "Python" in proc.stdout
 
 
-def test_build_not_yet_available(py_repo, tmp_path):
-    proc = run(str(py_repo), "--out", str(tmp_path / "o"))
-    assert proc.returncode == 2 and "--no-build" in proc.stderr
+def test_build_discover_runs_and_says_which_level_ran(py_repo, tmp_path):
+    """`--build discover` on a real Python project. What the project's own commands make of
+    this host is not the point -- that the check RAN, said so, and did not take the run down
+    with it is."""
+    proc = run(str(py_repo), "--build", "discover", "--out", str(tmp_path / "o"))
+    assert proc.returncode == 0, proc.stderr
+    assert "[build] ran at level discover" in proc.stderr
+    block = json.loads((tmp_path / "o" / "repo" / "measurement.json").read_text())
+    assert block["ext_signals"]["build"]["build_level"] == "discover"
+
+
+def test_the_warning_about_executing_the_repository_is_printed_once(tmp_path):
+    """Two repositories, one warning. It describes the command, not a repository, and a
+    warning repeated per repository is a warning people learn to scroll past."""
+    first = tiny_repo(tmp_path / "a" / "one")
+    second = tiny_repo(tmp_path / "b" / "two")
+    proc = run(
+        str(first),
+        str(second),
+        "--build",
+        "discover",
+        "--out",
+        str(tmp_path / "out"),
+        "--no-zip",
+    )
+    assert proc.returncode == 0, proc.stderr
+    warnings = [ln for ln in proc.stderr.splitlines() if "MODIFIES THE CHECKOUT" in ln]
+    assert len(warnings) == 1, warnings
+    assert "disposable clone" in warnings[0]
+
+
+def test_no_build_executes_nothing_and_says_nothing_about_it(py_repo, tmp_path):
+    proc = run(str(py_repo), "--no-build", "--out", str(tmp_path / "o"))
+    assert proc.returncode == 0, proc.stderr
+    assert "MODIFIES THE CHECKOUT" not in proc.stderr
+    assert "[build] ran at level" not in proc.stderr
+    doc = json.loads((tmp_path / "o" / "repo" / "measurement.json").read_text())
+    assert doc["ext_signals"]["build"] is None
+    assert "build: not run" in proc.stdout
 
 
 def test_all_dir_and_zip(repo_builder, tmp_path):
@@ -245,18 +283,41 @@ def test_summary_line_nulls_print_as_question_marks():
     )
 
 
-def test_plan_lines_count_files_and_skip_the_skipped(py_repo):
+def test_plan_lines_name_the_roots_and_the_size_of_the_walk(py_repo):
     from hazina_scan import report
 
     (py_repo / "node_modules").mkdir()
     (py_repo / "node_modules" / "huge.js").write_text("x\n")
     lines = report.plan_lines(py_repo, "none", 9000)
-    assert lines[0].startswith("[plan] ") and "files in" in lines[0]
-    assert "directories scanned" in lines[0]
+    assert lines[0].startswith("[plan] 1 project root (python),")
+    assert "files in" in lines[0] and "directories scanned" in lines[0]
     assert "node_modules" not in "\n".join(lines)
-    n_files = int(lines[0].split()[1])
-    assert n_files == len(list(py_repo.rglob("*.py"))) + 4  # README, LICENSE, pyproject, ci.yml
     assert "budget" in lines[1] and "minute" in lines[1]
+    # Nothing would run, so the split names the reading lanes alone.
+    assert "deterministic collectors" in lines[1] and "build probe" not in lines[1]
+
+
+def test_plan_lines_price_the_build_check_when_one_was_asked_for(py_repo):
+    from hazina_scan import report
+
+    lines = report.plan_lines(py_repo, "full", 9000)
+    assert "build probe" in lines[1]
+    # A budget the estimate does not fit inside is said out loud, with what will be cut.
+    short = report.plan_lines(py_repo, "full", 10)
+    assert any("EXCEEDS the budget" in line for line in short)
+    assert any("the build check" in line for line in short)
+
+
+def test_plan_lines_warn_about_roots_past_the_cap(py_repo):
+    from hazina_scan import report
+
+    for n in range(4):
+        part = py_repo / f"part{n}"
+        part.mkdir()
+        (part / "go.mod").write_text(f"module example.test/part{n}\n\ngo 1.21\n")
+    lines = report.plan_lines(py_repo, "discover", 9000, max_build_projects=2)
+    assert any("past the cap and will be reported skipped" in line for line in lines)
+    assert any("--max-build-projects" in line for line in lines)
 
 
 def test_a_subdirectory_of_a_repository_is_refused(py_repo, tmp_path):

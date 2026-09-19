@@ -1,9 +1,9 @@
 """The command line: validate every path, measure each repository, say what happened.
 
 THE ORDER IS THE POINT. Everything that can be refused is refused before the first lane
-starts: an unavailable build level, a path that is not a directory, a directory that is
-not a git repository, an `--all` that selects nothing. A run that cannot finish correctly
-should cost a second, not twenty minutes and a half-written output directory -- and
+starts: a path that is not a directory, a directory that is not a git repository, an
+`--all` that selects nothing, an `--out` inside a measured tree. A run that cannot finish
+correctly should cost a second, not twenty minutes and a half-written output directory -- and
 `tree.collect` on a non-repository answers with an empty block rather than an error, so
 "is this a repository" is a question this layer has to ask, not one it can rely on a
 collector to raise.
@@ -54,7 +54,17 @@ ZIP_NAME = "hazina-out.zip"
 #: them slower.
 DEFAULT_JOBS = 2
 
-_NO_BUILD = "error: the build check is not available in this release; pass --no-build"
+#: Said once per invocation, before the first build check starts, and never repeated per
+#: repository -- it describes what this command is about to do, not what one tree is like.
+#: It goes out ahead of the work rather than in the help text alone, because the person who
+#: typed the command is watching the terminal and may not have read the help at all.
+BUILD_WARNING = (
+    "[build] the build check executes THIS REPOSITORY'S OWN commands: it installs the "
+    "dependencies its manifests declare, runs its build, lists its tests and runs them. "
+    "Doing that MODIFIES THE CHECKOUT -- lockfiles, dependency directories, build output "
+    "-- so point this at a disposable clone rather than at a tree you are working in. "
+    "Pass --no-build to measure without executing anything."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--build",
         choices=("none", "discover", "full"),
         default="full",
-        help="The build check: resolve dependencies, install, build, then run the "
-        "project's own suite. NOT AVAILABLE IN THIS RELEASE -- pass --no-build.",
+        help="How much of the build check to run (default full). EXECUTES THE "
+        "REPOSITORY'S OWN COMMANDS and modifies the checkout, so use a disposable "
+        "clone: discover resolves dependencies, builds and lists the tests; full also "
+        "runs the suite and reads coverage back; none executes nothing.",
     )
     parser.add_argument(
-        "--no-build", action="store_true", help="Same as --build none. Required in this release."
+        "--no-build",
+        action="store_true",
+        help="Same as --build none: measure without executing anything of the repository's own.",
     )
     parser.add_argument(
         "--budget-seconds",
@@ -105,9 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=orchestrator.DEFAULT_BUDGET_SECONDS,
         dest="budget",
         help=f"Wall-clock budget for ONE repository (default "
-        f"{orchestrator.DEFAULT_BUDGET_SECONDS}). RECORDED, NOT ENFORCED in this "
-        f"release: it is reported against at the end of a run, but nothing stops "
-        f"work when it is spent. Enforcement arrives with the build check.",
+        f"{orchestrator.DEFAULT_BUDGET_SECONDS}). The git-backed lanes and the build "
+        f"check draw their ceilings from it and are enforced; the in-process readers are "
+        f"bounded by their own file and size caps instead. Work the budget does not reach "
+        f"is reported null with a reason rather than as a low number.",
     )
     parser.add_argument(
         "--build-budget-seconds",
@@ -293,6 +308,7 @@ class _Printer:
     def __init__(self, prefix: bool) -> None:
         self._lock = threading.Lock()
         self._prefix = prefix
+        self._said: set[str] = set()
 
     def label(self, name: str) -> str:
         """The prefix a lane clock should stamp on its own lines, or "" for one repo.
@@ -327,6 +343,19 @@ class _Printer:
         with self._lock:
             print(self.tag(name, text), file=sys.stderr, flush=True)
 
+    def once(self, text: str) -> None:
+        """Say something about the INVOCATION, exactly once, whoever gets there first.
+
+        Unlabelled on purpose: a warning about what this command is about to do to every
+        repository it was given is not a fact about whichever of them happened to reach it
+        first, and stamping a folder name on it would read as though it were.
+        """
+        with self._lock:
+            if text in self._said:
+                return
+            self._said.add(text)
+            print(text, file=sys.stderr, flush=True)
+
 
 def measure_one(repo: Path, name: str, args, out_dir: Path, printer: _Printer) -> dict:
     """Measure one repository, write its three files, and say what came out.
@@ -345,12 +374,16 @@ def measure_one(repo: Path, name: str, args, out_dir: Path, printer: _Printer) -
     clock = orchestrator.LaneClock(label=printer.label(name))
     deadline = orchestrator.Deadline(args.budget)
     try:
-        for line in report.plan_lines(repo, "none", args.budget):
+        for line in report.plan_lines(repo, args.build_level, args.budget, args.max_build_projects):
             printer.progress(name, line)
+        # Ahead of the lane that executes anything, and ahead of it for EVERY repository in
+        # the run, since the first one to arrive here is about to start installing.
+        if args.build_level != "none":
+            printer.once(BUILD_WARNING)
 
         row, measurement = orchestrator.measure(
             repo,
-            build_level="none",
+            build_level=args.build_level,
             jobs=0,
             clock=clock,
             deadline=deadline,
@@ -425,13 +458,9 @@ def write_zip(out_dir: Path) -> Path:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    # Refused FIRST, before the paths are even looked at: an operator with the default
-    # flags in a script learns at second one rather than after the fortieth repository,
-    # and a refused invocation has written nothing that a later upload could pick up.
-    build_level = "none" if args.no_build else args.build
-    if build_level != "none":
-        print(_NO_BUILD, file=sys.stderr)
-        return 2
+    # Settled once, here, so that every later reader of the level sees the same answer:
+    # `--no-build` is the plainer spelling of `--build none` and always wins over it.
+    args.build_level = "none" if args.no_build else args.build
 
     repos = select_repos(args, sys.stderr)
     if repos is None:

@@ -11,113 +11,128 @@ and then the time already spent buys nothing and the repository ends up recorded
 unmeasured. Saying up front roughly how long this will take removes the guesswork, so the
 forecast is printed before the first lane opens.
 
-The forecast's own walk (`survey`) is separate from the one `tree` does, and is as thin as
-it can be: it counts directory entries and nothing else -- no file is opened, decoded,
-hashed or classified. It prunes exactly the directories the real walk prunes, so the number
-it reports is the number of files the run will genuinely visit, and it gives up at a cap,
-after which it hedges with "at least". A forecast that costs a minute has already failed.
+The forecast's walk is the build check's own discovery pass (`build.discover.survey`), which
+is as thin as a walk gets: it counts directory entries and reads the manifest names it finds,
+and opens, decodes or hashes nothing. Reusing it rather than writing a second walk is what
+makes the forecast describe the run that is about to happen -- the project roots it names are
+the roots the check will actually probe, in the order it will reach them.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import NamedTuple
 
-from . import tree
+from .build import discover
 
-__all__ = ["Survey", "survey", "plan_lines", "summary_line", "timing", "SURVEY_CAP"]
+__all__ = ["estimate_run", "plan_lines", "summary_line", "timing"]
 
 # The deterministic fan-out is modelled as a straight line: a fixed set-up cost, plus so
 # many seconds for every thousand files. Both numbers come from watching real runs and
-# neither pretends to be better than an order of magnitude. The forecast is a courtesy; what
-# will one day bound a run is the budget, which this release records but does not yet
-# enforce.
+# neither pretends to be better than an order of magnitude. The build check's own estimate
+# comes from the module that will run it, which knows what a project root costs at each level.
 _SETUP_SECONDS = 5.0
 _SECONDS_PER_1000_FILES = 3.0
 
-# However large the repository, the forecast stops at an hour. Beyond some size the straight
-# line has nothing left to say, and announcing "a 412 minute run" would dress a guess up as
-# arithmetic.
+# However large the repository, the readers' forecast stops at an hour. Beyond some size the
+# straight line has nothing left to say, and announcing "a 412 minute run" would dress a guess
+# up as arithmetic.
 _LONGEST_FORECAST_SECONDS = 3600.0
 
-#: Directory entries the forecast's walk will look at before it stops counting. Past this it
-#: reports a floor instead of a total, because a forecast nobody waits for is worthless.
-SURVEY_CAP = 200_000
+#: What the two phases are called in the split the forecast prints. The first name covers
+#: every lane that runs concurrently; the second is the one lane that runs alone.
+_READERS = "deterministic collectors"
+_BUILD = "build probe"
 
 
-class Survey(NamedTuple):
-    """How much there is to look at. `partial` is True when the walk hit its cap, in which
-    case the two counts are floors and every sentence built from them has to hedge."""
-
-    files: int
-    directories: int
-    partial: bool
+def _plural(n: float, singular: str, plural: str | None = None) -> str:
+    """Pick `singular` or `plural` for `n`, comparing the ROUNDED value so "1.0" stays singular."""
+    return singular if round(n) == 1 else (plural or f"{singular}s")
 
 
-def _spoken_duration(seconds: float) -> str:
-    """Render a span the way it would be said aloud, as an adjective: "a 40 second run".
+def _spoken_duration(seconds: float, *, standalone: bool = False) -> str:
+    """Render a span the way it would be said aloud.
 
-    Below two minutes it stays in seconds. Above that it switches to minutes, because
+    Below two minutes it stays in seconds; above that it switches to minutes, because
     telling somebody to expect "a 0 minute run" answers nothing they asked.
+
+    Two forms, chosen by `standalone`. As an adjective before a noun ("a 40 second run"),
+    the unit stays singular no matter the count -- that is how an ordinary compound
+    adjective in English works, and it is the default here. As a number standing on its
+    own ("40 seconds", "1 second"), pass `standalone=True` so the unit is pluralised
+    correctly instead.
     """
     if seconds < 120:
-        return f"{seconds:.0f} second"
-    return f"{seconds / 60:.0f} minute"
+        n, unit = seconds, "second"
+    else:
+        n, unit = seconds / 60, "minute"
+    word = _plural(n, unit) if standalone else unit
+    return f"{n:.0f} {word}"
 
 
-def survey(repo: Path, cap: int = SURVEY_CAP) -> Survey:
-    """Count what a run would walk over, stopping once `cap` entries have been seen.
-
-    Directories the tree collector ignores -- `.git`, `node_modules`, `vendor`, dot
-    directories that are not specifically kept -- are ignored here too, so the answer
-    describes the work ahead rather than the size of the checkout.
-    """
-    files = directories = 0
-    partial = False
-    for _here, subdirectories, filenames in os.walk(Path(repo)):
-        # Rewriting the list in place is what stops os.walk descending, and the predicate is
-        # the collector's own, so the two walks prune identically.
-        subdirectories[:] = [d for d in subdirectories if not tree.should_skip_dir(d)]
-        directories += 1
-        files += len(filenames)
-        if files + directories >= cap:
-            partial = True
-            break
-    return Survey(files, directories, partial)
-
-
-def _forecast_seconds(files: int) -> float:
+def _reader_seconds(files: int) -> float:
     return min(_LONGEST_FORECAST_SECONDS, _SETUP_SECONDS + _SECONDS_PER_1000_FILES * files / 1000.0)
 
 
-def plan_lines(repo: Path, build_level: str, budget: int) -> list[str]:
+def estimate_run(
+    repo: Path, build_level: str, max_build_projects: int = discover.MAX_PROBED_PROJECTS
+) -> tuple[float, dict[str, float], dict]:
+    """`(seconds, per-phase seconds, the read-only survey both came from)`.
+
+    The lane graph is two phases, so the total is the concurrent readers PLUS the build
+    check, never the sum of every lane: the readers overlap each other and the check
+    overlaps nothing.
+    """
+    found = discover.survey(repo, max_build_projects)
+    phases = {
+        _READERS: _reader_seconds(found["files_scanned"] or 0),
+        _BUILD: discover.estimate_seconds(found, build_level),
+    }
+    return phases[_READERS] + phases[_BUILD], phases, found
+
+
+def plan_lines(
+    repo: Path,
+    build_level: str,
+    budget: int,
+    max_build_projects: int = discover.MAX_PROBED_PROJECTS,
+) -> list[str]:
     """Say what this run is about to cost, while it can still be reconsidered.
 
-    Always two lines -- what was found, and how long that looks like -- and a third when the
-    forecast overruns the budget. Nothing in this release stops a run at the budget, so
-    that third line is a warning about how long this will take and not a description of
-    what will be left out.
+    Two lines always -- what is in the tree, and how long that looks like against the budget
+    -- and a further line for each of the two ways a run can come back with less than it was
+    asked for: more project roots than the check may reach, and an estimate the budget does
+    not cover. Both are said before a second has been spent, because the remedy for either
+    is a flag, and a flag is only useful before the run.
     """
-    found = survey(repo)
-    forecast = _forecast_seconds(found.files)
-    hedge = "at least " if found.partial else ""
+    total, phases, found = estimate_run(repo, build_level, max_build_projects)
+    ecosystems = ", ".join(found["ecosystems"]) or "no build manifest found"
+    split = ", ".join(
+        f"{name} {_spoken_duration(value, standalone=True)}"
+        for name, value in phases.items()
+        if value
+    )
 
     lines = [
-        f"[plan] {hedge}{found.files} files in {found.directories} directories scanned",
-        f"[plan] this looks like a {_spoken_duration(forecast)} run against a "
-        f"{_spoken_duration(budget)} budget (rough, from repository size)",
+        f"[plan] {found['n_projects']} {_plural(found['n_projects'], 'project root')} "
+        f"({ecosystems}), {found['files_scanned']} "
+        f"{_plural(found['files_scanned'], 'file')} in {found['dirs_scanned']} "
+        f"{_plural(found['dirs_scanned'], 'directory', 'directories')} scanned",
+        f"[plan] this looks like a {_spoken_duration(total)} run against a "
+        f"{_spoken_duration(budget)} budget (rough, from repository size and project "
+        f"count): {split}",
     ]
-    if build_level != "none":
-        # The command line rejects every level but "none" before control reaches here, so
-        # this is currently unreachable. It is said out loud anyway: on the day the build
-        # lane lands, a level the forecast does not model should be visible, not silent.
-        lines.append(f"[plan] the build check at level {build_level} is not part of this estimate")
-    if forecast > budget:
+    if found["n_projects_over_cap"]:
         lines.append(
-            "[plan] the estimate EXCEEDS the budget. The budget is recorded but "
-            "not enforced in this release, so the run will go past it rather "
-            "than stop; raise --budget-seconds to record a realistic one."
+            f"[plan] {found['n_projects_over_cap']} of {found['n_projects']} "
+            f"{_plural(found['n_projects'], 'project root')} are past the cap and will be "
+            f"reported skipped rather than measured; raise --max-build-projects to probe them"
+        )
+    if total > budget:
+        cut = "the build check" if phases[_BUILD] else "the reading lanes"
+        lines.append(
+            f"[plan] the estimate EXCEEDS the budget, so expect {cut} to be cut short: "
+            f"whatever the budget does not reach is reported null with a reason, never as a "
+            f"low number. Raise --budget-seconds to measure it all."
         )
     return lines
 
@@ -164,8 +179,25 @@ def summary_line(row: dict, measurement: dict) -> str:
         f"{_display_name(row, measurement)}  {row.get('primary_language') or '?'}  "
         f"{_grouped(row.get('loc'))} LOC  {_grouped(row.get('commit_count'))} commits  "
         f"{_grouped(row.get('author_count'))} authors  tests: {tests}  ci: {ci}  "
-        f"build: not run"
+        f"build: {_build_word(row, measurement)}"
     )
+
+
+def _build_word(row: dict, measurement: dict) -> str:
+    """One word for the build check: what it was, or that it was not asked for.
+
+    `?` and `not run` are kept apart deliberately. A check that ran and could not attribute
+    what it saw is a different fact from a check nobody asked for, and collapsing the two
+    would let a run whose verdict is genuinely unknown read as a run that skipped the
+    question.
+    """
+    block = (measurement.get("ext_signals") or {}).get("build")
+    if not block or block.get("build_skipped"):
+        return "not run"
+    verdict = row.get("build_ok")
+    if verdict is None:
+        return "?"
+    return "ok" if verdict else "failed"
 
 
 def timing(clock) -> str:

@@ -520,9 +520,9 @@ CI_CONFIGS: list[tuple[str, str]] = [
 
 CI_SYSTEMS: frozenset[str] = frozenset(name for _, name in CI_CONFIGS)
 
-#: The keys whose value is a shell command, or a list of them, across the CI systems
-#: above: GitHub Actions and CircleCI use `run`, GitLab/Travis/Bitbucket/Azure use
-#: `script`, Drone and Woodpecker use `commands`, Cloud Build uses `args`.
+#: Per CI system, the step key whose value holds a shell command or a list of them: GitHub
+#: Actions and CircleCI call it `run`, GitLab, Travis, Bitbucket and Azure call it `script`,
+#: Drone and Woodpecker call it `commands`, and Cloud Build calls it `args`.
 CI_COMMAND_KEYS: frozenset[str] = frozenset(
     {
         "run",
@@ -956,8 +956,9 @@ CLASS_DEP_KEYWORDS: dict[str, dict[str, list[str]]] = {
         "composer": ["laravel"],
         "maven": ["org.springframework.boot", "spring-boot*"],
     },
-    # npm only, on purpose. PyPI has packages called `lit`, `astro`, `solid` and `ember`,
-    # and none of them makes a repository a frontend.
+    # Deliberately npm-only. PyPI happens to have unrelated packages also named `lit`,
+    # `astro`, `solid` and `ember`, and none of those turn a Python repository into a
+    # frontend.
     "frontend_frameworks": {
         "npm": [
             "react",
@@ -1092,24 +1093,26 @@ BACKEND_FRAMEWORK_MARKERS: frozenset[str] = frozenset(
 #: `css_loc_ratio`.
 WEB_LANGUAGES: frozenset[str] = frozenset({"TypeScript", "JavaScript", "Vue", "Svelte"})
 
-#: A frontend needs frontend material: component files, real CSS weight, or a meaningful
-#: share of web-language LOC. Below all three, keyword and framework hits are noise.
+#: Calling something a frontend requires frontend evidence besides keywords: component
+#: files, a real amount of CSS, or a non-trivial share of lines in a web language. Without
+#: at least one of those three, keyword and framework hits alone are treated as noise.
 MIN_FRONTEND_WEB_LOC_SHARE: float = 0.10
 MIN_FRONTEND_CSS_RATIO: float = 0.02
 
-#: A term counts as independent support only if it is worth at least this much, so a
-#: rounding-error contribution is not "a second signal".
+#: The minimum weight a term must contribute before it is treated as its own independent
+#: piece of support, so a negligible, rounding-error-sized contribution does not get
+#: counted as a whole additional signal.
 SUPPORT_TERM_FLOOR: float = 0.5
 
-#: A class supported by exactly ONE signal family must clear this to name the primary class
-#: over a corroborated rival.
+#: The bar a single-family class has to clear before it can outrank a rival class that has
+#: corroboration from more than one signal family.
 MIN_SINGLE_FAMILY_RAW: float = 4.0
 
 #: A leading score under this figure is too faint to support any conclusion at all.
 MIN_PRIMARY_RAW: float = 1.0
 
-#: The evidence total below which the classifier does not claim to know the class. Chosen
-#: as the weakest single corroborated signal the scorer can emit.
+#: Below this much accumulated evidence, the classifier declines to name a class at all
+#: rather than guess. Set at the lowest score a corroborated signal can actually produce.
 MIN_CONFIDENCE_EVIDENCE: float = 1.0
 
 #: The named reasons a repository can be judged a demonstration or a scaffold rather than
@@ -1356,8 +1359,9 @@ SIGNAL_FAMILIES: tuple[str, ...] = (
 #: Where an industry guess came from.
 INDUSTRY_SIGNALS: tuple[str, ...] = ("readme", "dependencies")
 
-#: Our own industry vocabulary, not the repository's. What leaves under the industry field
-#: is one of these words or nothing at all, so no README prose can ride out through it.
+#: This tool's own fixed set of industry labels, entirely independent of the repository's
+#: own wording. The industry field can only ever hold one of these values or be empty --
+#: never text copied out of a README.
 INDUSTRIES: tuple[str, ...] = (
     "fintech",
     "healthcare",
@@ -1388,20 +1392,22 @@ INDUSTRIES: tuple[str, ...] = (
     "biotech",
 )
 
-# The shape a company name may have, and the privacy control that makes naming one safe.
-# Bounded in length and restricted to the characters a company name actually holds, so that
-# something else cannot ride through wearing a name:
+# Defines what a company name is allowed to look like, which is also what keeps emitting
+# one safe from a privacy standpoint. Length-capped and restricted to characters a real
+# company name would actually contain, so nothing else can pass itself off as a name:
 #
-#   / \   a filesystem path -- an absolute path is exactly what must not leave
-#   @     an address or a handle
-#   :     a URL, a scheme, or host:port
-#   _     an identifier written in snake_case, so a symbol and not a name
+#   / \   looks like a filesystem path -- an absolute path is exactly the thing that must
+#         never be emitted
+#   @     looks like an address or a handle
+#   :     looks like a URL, a scheme, or a host:port pair
+#   _     looks like a snake_case identifier, i.e. a symbol rather than a name
 #
-# And the rule doing most of the work: a dot may END a word but may never JOIN two
-# characters. "Acme Systems, Inc." passes; `acme.com`, `com.acme.payments` and
-# `payments_core.py` are all refused by that one rule. The letter class runs through the
-# Latin-1 supplement so a European legal entity is spelled rather than mangled -- a letter
-# is not a path and it is not an address, so widening it widens nothing that matters.
+# The rule doing the heavy lifting: a period may close out a word but may never sit between
+# two letters joining them together. That lets "Acme Systems, Inc." through while rejecting
+# `acme.com`, `com.acme.payments` and `payments_core.py` all with the same check. The
+# allowed letters extend into the Latin-1 supplement so an accented European company name is
+# preserved rather than garbled -- accented letters are neither paths nor addresses, so
+# there is no privacy cost to allowing them.
 _LETTER = "A-Za-zÀ-ÖØ-öø-ÿ"
 _NAME_WORD = rf"[{_LETTER}0-9][{_LETTER}0-9&'-]{{0,39}}[.,]?"
 #: A lone ampersand is a word of its own in "The Procter & Gamble Company", but may not
@@ -1546,9 +1552,10 @@ NOT_A_COMPANY: frozenset[str] = frozenset(
     }
 )
 
-#: Whose SPELLING of an agreed name is shown. Deliberately not the strength order in
-#: `SIGNAL_FAMILIES`: this asks which source writes a company's name the way a human would,
-#: and a licence file carries the registered name while a remote carries a URL slug.
+#: Once a candidate name is agreed on, this decides whose exact wording of it gets shown --
+#: a separate question from `SIGNAL_FAMILIES`'s strength ranking, and deliberately answered
+#: differently: it favours whichever source spells the name the way a person would, since a
+#: licence file tends to carry the full registered name while a remote URL only has a slug.
 COMPANY_DISPLAY_PREFERENCE: tuple[str, ...] = (
     "licence_file",
     "copyright_header",
@@ -1564,19 +1571,22 @@ RIGHTS_NOISE_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# A copyright NOTICE, which is a much narrower thing than the word "copyright" wherever it
-# appears. Two guards, and a licence text put each of them here:
+# Matches a genuine copyright NOTICE, a much narrower target than every place the word
+# "copyright" happens to occur in a document. Two separate requirements, both added because
+# of specific false positives seen in real licence text:
 #
-#   1. It must START the line, allowing only a brief run of comment characters in front
-#      (`#`, `//`, `/*`, ` *`). Real notices occupy a line to themselves, while a passing
-#      reference turns up part-way through a sentence. The definitions section of
-#      Apache-2.0 contains the phrase "the copyright owner or entity authorized by the
-#      copyright owner"; drop the anchor and an enormous number of repositories report a
-#      company named "owner or entity authorized by".
-#   2. A YEAR OR A (c)/(C) MARKER, checked separately on the `marker` group. That is what a
-#      real notice carries and what CC0's line-initial "Copyright and Related Rights ..."
-#      does not. It costs "Copyright Acme Systems" with no year at all, and buys back every
-#      licence whose body opens with the bare word.
+#   1. The match has to START the line, with at most a short run of comment syntax ahead of
+#      it (`#`, `//`, `/*`, ` *`). A genuine notice is written on a line of its own, whereas
+#      an incidental mention of the word shows up mid-sentence -- the Apache-2.0 definitions
+#      section, for instance, contains "the copyright owner or entity authorized by the
+#      copyright owner", and without anchoring to line-start, that phrase alone would get a
+#      huge number of Apache-licensed repositories reporting a company literally named
+#      "owner or entity authorized by".
+#   2. A year, or a `(c)`/`(C)` marker, has to appear too, checked through the separate
+#      `marker` group. A real notice always carries one of these; CC0's opening line,
+#      "Copyright and Related Rights ...", does not. The cost of requiring it is missing a
+#      bare "Copyright Acme Systems" with no year attached, in exchange for not matching
+#      every document whose body happens to start with the word "Copyright".
 COPYRIGHT_NOTICE_RE: re.Pattern[str] = re.compile(
     r"^[^\w\n]{0,24}copyright\b"
     r"(?P<marker>[\s.:]*(?:\(c\)|\(co\)|©|&copy;)?[\s.:]*"
@@ -1590,11 +1600,12 @@ COPYRIGHT_NOTICE_RE: re.Pattern[str] = re.compile(
 #: The second guard above, applied to whatever the `marker` group swallowed.
 YEAR_OR_MARKER_RE: re.Pattern[str] = re.compile(r"\d{4}|\(c\)|\(co\)|©|&copy;", re.IGNORECASE)
 
-#: Directories the identity walk never enters. A superset of a build-output list for one
-#: reason: VENDORED TREES are the live hazard for the copyright family. A bundled
-#: dependency's header names ITS author, and reporting that as the owner of this repository
-#: would be confidently wrong. Kept apart from `SKIP_DIRS`, which answers a different
-#: question for a different walk and does not list `third_party` or `Pods`.
+#: Directories `identity.py` never descends into. This list is broader than a typical
+#: build-output exclusion list for one specific reason: a vendored dependency tree is the
+#: real risk for the copyright-header signal, since the header inside a bundled dependency
+#: names that dependency's own author, and mistaking that for this repository's owner would
+#: be a confident, specific wrong answer. Kept separate from `SKIP_DIRS`, which serves a
+#: different walk with a different purpose and does not exclude `third_party` or `Pods`.
 IDENTITY_SKIP_DIRS: frozenset[str] = frozenset(
     {
         ".git",
@@ -1628,9 +1639,9 @@ IDENTITY_SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
-#: Matched as a PREFIX against the upper-cased filename, not as a stem: `LICENSE-MIT` and
-#: `LICENSE-APACHE` are how a dual-licensed repository spells it, and `COPYING.LESSER` is
-#: how the LGPL does.
+#: Checked as a prefix of the upper-cased filename rather than requiring an exact stem
+#: match, because real repositories spell this several ways: a dual-licensed project might
+#: use `LICENSE-MIT` or `LICENSE-APACHE`, and an LGPL project might use `COPYING.LESSER`.
 LICENCE_FILE_PREFIXES: tuple[str, ...] = ("LICENSE", "LICENCE", "NOTICE", "COPYING", "COPYRIGHT")
 
 #: The files a copyright header can be in. Wider than `CODE_EXTENSIONS` in some places and
@@ -1673,13 +1684,14 @@ IDENTITY_SOURCE_SUFFIXES: frozenset[str] = frozenset(
     }
 )
 
-#: POM elements that carry SOMEBODY ELSE'S identity, cut out before the project's own is
-#: read. `parent` is the one that matters most: Maven puts it ahead of the project's own
-#: coordinates, so the first `<groupId>` in a Spring Boot pom is `org.springframework.boot`
-#: and a naive read names the framework every Java web project is built on as its author.
-#: `developers` and `contributors` are PERSON records, and a developer's `<organization>`
-#: is that person's employer. `distributionManagement` can carry a `<relocation>`, whose
-#: groupId is the coordinates the artifact moved AWAY from.
+#: Elements of a `pom.xml` that describe an identity belonging to someone other than the
+#: project itself, stripped out before this parser reads the project's own coordinates. The
+#: most important is `parent`: Maven lists it before the project's own coordinates, so a
+#: parser that just grabs the first `<groupId>` in a Spring Boot POM would attribute the
+#: project to `org.springframework.boot` -- the framework, not the author. `developers` and
+#: `contributors` describe people, and a person's `<organization>` element names their
+#: employer rather than the project's owner. A `<relocation>` nested under
+#: `distributionManagement` names the coordinates an artifact moved away from, not toward.
 POM_FOREIGN_BLOCKS: tuple[str, ...] = (
     "parent",
     "dependencies",
@@ -1717,9 +1729,9 @@ GROUP_ID_DOMAIN_WORDS: frozenset[str] = frozenset(
     }
 )
 
-#: Industry keywords matched on WORD BOUNDARIES against the README. Distinctive words only:
-#: a single keyword must never name an industry on its own, which is why two hits are
-#: required before any of this counts.
+#: Industry keywords matched against the README text at word boundaries, using words
+#: distinctive enough to be meaningful. Even so, one match alone is never trusted to name an
+#: industry by itself -- at least two separate hits are required before this table counts.
 INDUSTRY_README_WORDS: dict[str, tuple[str, ...]] = {
     "fintech": (
         "payments",
@@ -1937,10 +1949,11 @@ INDUSTRY_README_WORDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: Industry keywords matched as SUBSTRINGS against declared dependency names, which is how
-#: a Go module path and an npm package resolve to the same signal. These are public
-#: technology names, like every other table here -- nothing read out of the repository is
-#: emitted under the industry field, only the word on the left.
+#: Industry keywords matched as substrings of a declared dependency's name, which lets a Go
+#: module path and an npm package name that both reference the same technology produce the
+#: same signal. Every entry here, like the rest of this file's tables, names a public
+#: technology; the industry field only ever emits the label on the left side, never
+#: anything read directly out of the repository's own dependency list.
 INDUSTRY_DEPENDENCY_WORDS: dict[str, tuple[str, ...]] = {
     "fintech": (
         "stripe",
@@ -2067,11 +2080,12 @@ TECH_NAMES: frozenset[str] = frozenset(
 # Git history: authors, subjects and the file classes a commit is read through
 # ---------------------------------------------------------------------------
 
-#: Names and addresses that belong to a machine rather than a person. Matched against
-#: "<name> <email>" as one string, so a vendor listed here is a robot under either.
-#: The names that are also company names or surnames (codecov, vercel, netlify,
-#: sonarcloud, stale) are reached through the `[bot]` suffix rather than as bare words,
-#: so an engineer with a `@vercel.com` address is not filed as a machine.
+#: Committer names and addresses recognised as automation rather than a human. The match
+#: runs over "<name> <email>" combined into one string, so an entry here catches either
+#: half. Entries whose bare word could also be a company name or a real surname (codecov,
+#: vercel, netlify, sonarcloud, stale) are only matched via their `[bot]` suffix, so that a
+#: person who genuinely works at Vercel and commits from a `@vercel.com` address is not
+#: mistaken for automation.
 BOT_NAME_PATTERNS: list[re.Pattern] = [
     re.compile(r, re.I)
     for r in [
@@ -2494,9 +2508,11 @@ STRUCTURE_EXT_LANG: dict[str, str] = {
     ".fnc": "sql",
     ".tsql": "sql",
     ".ddl": "sql",
-    # single-file component formats. The grammar holds the embedded script as opaque text,
-    # so these yield no function boundaries -- but a Vue or Svelte application is entirely
-    # code, and omitting them would read one as holding none.
+    # single-file component formats. Their grammars treat the embedded script block as
+    # opaque text rather than parsing into it, so none of these can ever contribute a
+    # function boundary -- yet a Vue or Svelte file is genuinely full of code, so leaving
+    # these extensions out of the map entirely would make such a codebase look like it
+    # holds none.
     ".vue": "vue",
     ".svelte": "svelte",
     ".astro": "astro",
@@ -2529,9 +2545,10 @@ STRUCTURE_EXT_UNPARSED: frozenset[str] = frozenset(
         ".vapi",
         ".genie",
         ".metal",
-        # statistics and numerics: Stata, J, the kdb+ family, Wolfram. Mercury is knowingly
-        # absent -- it shares `.m` with MATLAB and Objective-C, and losing a MATLAB tree's
-        # attribution to disambiguate a rare language is the worse trade.
+        # statistics and numeric-computing languages: Stata, J, the kdb+ family, Wolfram.
+        # Mercury is left out on purpose -- it shares the `.m` extension with MATLAB and
+        # Objective-C, and adding a third candidate to disambiguate would cost MATLAB
+        # detection accuracy for a language that shows up far less often in practice.
         ".sas",
         ".do",
         ".ado",
@@ -2608,15 +2625,17 @@ STRUCTURE_EXT_UNPARSED: frozenset[str] = frozenset(
     }
 )
 
-#: Node names that are a branch, a loop or a guarded path -- one decision the code makes.
-#: Spelt broadly because grammars disagree on names for the same construct, and read out
-#: of the grammars' own node vocabularies rather than guessed. Over-counting one construct
-#: uniformly across a language does no harm, because what gets computed from these is a
-#: proportion and a constant factor cancels out of it. Missing constructs is the error that
-#: actually distorts the figure, so the set is drawn generously. What stays out are names
-#: that contain a keyword without branching on anything -- type-level spellings, the C
-#: preprocessor's `#if`, SQL's `keyword_case` -- since those skew one language against its
-#: own function bodies instead of scaling it evenly.
+#: Grammar node type names that represent a branch, a loop or another guarded path -- in
+#: other words, one decision point. This set is intentionally generous and drawn straight
+#: from each grammar's own vocabulary rather than guessed at, because grammars name the same
+#: construct differently from one another. Counting one construct too many, uniformly across
+#: a whole language, is harmless here since the downstream metric is a proportion and a
+#: constant multiplier cancels out of a ratio; missing a real construct is the mistake that
+#: actually skews the number, which is why the set errs toward inclusion. Deliberately
+#: excluded are names that merely contain a decision-sounding keyword without representing
+#: an actual branch -- a type-level spelling, the C preprocessor's `#if`, SQL's
+#: `keyword_case` -- since counting those would inflate one language's figure relative to
+#: how its function bodies are actually measured.
 STRUCTURE_DECISION_NODES: frozenset[str] = frozenset(
     {
         # the C-family and English core
@@ -2837,16 +2856,17 @@ STRUCTURE_DECISION_NODES: frozenset[str] = frozenset(
     }
 )
 
-#: Which node a decision gets counted against. Kept tighter than the decision table by
-#: design: a name matching something nested INSIDE a function steals that function's
-#: decisions
-#: and fragments the distribution, so `*_body`, bare `block` and `*_type` spellings are all
-#: absent. A language earns an entry here only if the decision table covers it too --
-#: function nodes for a language whose branches are invisible would emit a stream of
-#: zero-decision functions and inflate the top share with nothing behind it. That is why
-#: the s-expression languages, the single-file component formats and the grammars with no
-#: statement structure appear in the extension map and not here: their files and lines
-#: count, their complexity is not attributed.
+#: Determines which node type a decision is attributed to as its enclosing function. This
+#: table is deliberately kept narrower than the decision table: a node name that would match
+#: something nested inside a function -- a bare `block`, a `*_body` or `*_type` spelling --
+#: is left out, because matching it would pull decisions away from the actual function and
+#: fragment the counts. A language is only listed here if it also has entries in the
+#: decision table; giving a language function nodes here while its branches stay invisible
+#: to that table would flood the results with functions counted as having zero decisions and
+#: distort the density figures with nothing real behind them. That constraint is exactly why
+#: the s-expression languages, the single-file component formats, and grammars with no real
+#: statement structure show up in the extension-to-language map but not in this table: their
+#: files and their line counts are still measured, just not their structural complexity.
 STRUCTURE_FUNCTION_NODES: frozenset[str] = frozenset(
     {
         # the C-family and English core
@@ -2913,11 +2933,13 @@ STRUCTURE_FUNCTION_NODES: frozenset[str] = frozenset(
         "storage_function",
         "native_function",
         "receive_function",
-        # Dart puts the signature and the body side by side under the declaration with no node
-        # spanning both, so the body is the only span that holds the decisions. In Kotlin,
-        # Swift, D and Solidity the same name nests inside the definition, which makes the
-        # definition a phantom and moves attribution to the body -- the same partition either
-        # way, since decisions live in the body regardless.
+        # In Dart's grammar, the signature and the body sit as siblings under the
+        # declaration node rather than one containing the other, so only the body's own
+        # span can hold decision counts. Kotlin, Swift, D and Solidity structure it
+        # differently -- the body node nests inside the definition node -- which turns the
+        # outer definition into an empty wrapper and shifts attribution down to the inner
+        # body instead. Either arrangement ends up counting decisions against the body,
+        # since that is where they actually occur.
         "function_body",
         # blocks that carry the behaviour in the languages that declare them
         "always_construct",
@@ -2927,24 +2949,29 @@ STRUCTURE_FUNCTION_NODES: frozenset[str] = frozenset(
     }
 )
 
-#: The residue the two structural rules in the walk cannot reach: a name that is the
-#: definition in one language and a nested, non-leaf component of it in another, where the
-#: outer node holds decisions of its own so it is not a phantom either. Suppressing the
-#: name for those languages is the only thing left that stops one empty function being
-#: opened per real one. Short because it was found by walking a snippet per language, not
-#: inferred from the names.
+#: Covers the cases the walk's two general structural rules cannot resolve on their own: a
+#: node name that is the actual function definition in one language but a nested,
+#: non-leaf piece of it in another, where the outer node genuinely holds decisions of its
+#: own and so does not qualify as an empty wrapper either. For those specific languages,
+#: explicitly excluding the inner name is the only remaining way to avoid opening a second,
+#: empty function entry for every real one. This list is short because each entry was
+#: confirmed by walking a sample snippet through that language's actual grammar, not
+#: guessed from the node names alone.
 STRUCTURE_FUNCTION_NODES_EXCLUDED: dict[str, frozenset[str]] = {
     "systemverilog": frozenset({"function", "function_statement"}),
     "perl": frozenset({"function"}),
     "jai": frozenset({"procedure"}),
 }
 
-#: Elixir has no syntax of its own for either a definition or a branch: `def`, `if` and
-#: `case` are macros, so the grammar renders every one of them as an ordinary `call`. No
-#: node name in the tree means "function" or "if", and an Elixir module would otherwise
-#: read as having neither -- a mainstream language scoring like an empty tree. Matching on
-#: the call's head word recovers both. Keyed by language, so no other grammar pays the
-#: lookup. The pair is (heads that open a function, heads that are a decision).
+#: Elixir's grammar has no dedicated node type for either a function definition or a
+#: branch, because `def`, `if` and `case` are all macros there, and the parser represents
+#: every one of them as a plain `call` node. Nothing in the tree is literally named
+#: "function" or "if", so without special handling a real Elixir module would parse as
+#: though it contained neither -- a widely used language scoring as though its tree were
+#: empty. Checking the word at the head of each `call` node recovers both categories. This
+#: table is keyed per language specifically so no other grammar pays for the extra lookup,
+#: and each entry is a pair: the head words that mark a function, and the head words that
+#: mark a decision.
 STRUCTURE_CALL_HEADS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "elixir": (
         frozenset({"def", "defp", "defmacro", "defmacrop"}),
@@ -2986,15 +3013,17 @@ STRUCTURE_GENERATED_HEADER: re.Pattern[bytes] = re.compile(
     rb"@generated|DO NOT EDIT|Code generated by|autogenerated", re.I
 )
 
-#: Error handling, counted by keyword. The honest limit of the measurement is worth
-#: stating: these are lexical, so they fire inside comments and string literals too, and
-#: they cannot see error handling a language expresses in its TYPES rather than its words
-#: -- Rust's `?`, Haskell's ExceptT, an OCaml `option` return. Those languages are
-#: systematically undercounted and no keyword list fixes it. `require` is in the list and
-#: is an import in several of these languages: it is kept as is so measurements stay
-#: comparable across versions, and dropping it would move the number on every repository
-#: measured so far. Bare `error`, `exception` and `warn` are out:
-#: ordinary identifiers in Go, ordinary prose in a comment, and logging respectively.
+#: A plain keyword list used to count error-handling constructs. Worth being upfront about
+#: its limits: matching is purely lexical, so a keyword counts just as much inside a comment
+#: or a string literal as it does in real code, and there is no way for a keyword list to
+#: see error handling that a language expresses through its type system instead of its
+#: vocabulary -- Rust's `?` operator, Haskell's ExceptT, an OCaml `option` return are all
+#: invisible to this table and always will be regardless of how the list is tuned. `require`
+#: stays on the list even though it doubles as an import keyword in some of these languages,
+#: because removing it now would shift the count for every repository already measured and
+#: break comparability across tool versions. Left off deliberately are the bare words
+#: `error`, `exception` and `warn`, since they are respectively an ordinary Go identifier, a
+#: word that shows up constantly in unrelated comments, and a logging term.
 STRUCTURE_ERROR_KEYWORDS: re.Pattern[bytes] = re.compile(
     rb"\b(try|catch|except|rescue|finally|throw|throws|raise|panic|recover|"
     rb"unwrap_or|map_err|expect_err|ok_or|"

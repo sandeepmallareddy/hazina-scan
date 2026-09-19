@@ -26,7 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sandeepmallareddy/hazina-scan"
+Homepage = "https://hazinalabs.com"
+Repository = "https://github.com/sandeepmallareddy/hazina-scan"
 Issues = "https://github.com/sandeepmallareddy/hazina-scan/issues"
 Changelog = "https://github.com/sandeepmallareddy/hazina-scan/blob/main/CHANGELOG.md"
 

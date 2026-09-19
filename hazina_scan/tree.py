@@ -33,10 +33,11 @@ from collections import defaultdict
 from pathlib import Path
 
 try:
-    # CI configuration is YAML and every CI system requires it to parse, so the jobs, the
-    # steps and the `if:` guards are read rather than the file being searched for the word
-    # "test". Optional, so that a checkout without it still runs -- and when it is missing
-    # the three CI flags are reported unmeasured rather than guessed.
+    # Every CI system this tool reads writes its configuration as YAML, so parsing that
+    # structure -- the jobs, the steps, the `if:` guards -- is how job and step content is
+    # actually read, rather than grepping the raw text for a word like "test". The import
+    # is optional so a checkout can still be scanned without PyYAML present; the three CI
+    # flags simply come back unmeasured instead of being guessed from partial information.
     import yaml
 except ImportError:  # pragma: no cover - PyYAML is a pinned dependency
     yaml = None
@@ -132,15 +133,18 @@ def walk_source_files(root: Path) -> list[tuple[Path, str]]:
 
 
 def jvm_dotnet_loc_share(loc_by_language: dict[str, int], total_loc: int) -> float | None:
-    """Share of counted lines written in the JVM/.NET family, 0.0 to 1.0.
+    """Fraction of the counted lines that belong to a JVM or .NET language, from 0.0 to 1.0.
 
-    A scalar rather than a per-language key because a gate cannot read
-    `loc_by_language.Java`: an absent key is unmeasured rather than zero, so every
-    repository without Java would land in a partial verdict and the scores would stop
-    being comparable. This is always emitted, so it has no such hole.
+    Returned as one combined number instead of leaving a caller to look up individual
+    per-language keys in `loc_by_language`. A per-language lookup has a gap built in: a
+    repository with no Java at all has no `Java` key, which is not the same thing as zero
+    Java, and a gate written against the raw dict would have to special-case every missing
+    key itself. Computing the ratio here once removes that gap, since it is always present
+    in the output.
 
-    None only when nothing at all was counted -- a repository with no source is a
-    question for the empty-repository screen, not something to report a 0.0 share for.
+    Only returns None when `total_loc` is zero, meaning nothing was counted at all -- that
+    is a question for whatever handles an empty repository, not a case this function should
+    paper over by reporting a 0.0 share.
     """
     if not total_loc:
         return None
@@ -562,11 +566,12 @@ def _python_requirement_names(specs) -> list[str]:
 
 
 def _yaml_block_keys(text: str, sections: tuple[str, ...]) -> list[str]:
-    """The keys nested one level under any of `sections` in a simple YAML mapping.
+    """List the keys indented one level beneath any of `sections` in a YAML-ish mapping.
 
-    Deliberately naive rather than a parser: the blocks this reads -- a pubspec's
-    `dependencies`, a conda environment's `dependencies`/`pip` -- are flat lists of names,
-    and a YAML dependency is not worth taking on to read a dependency list.
+    This is a plain indentation scan, not an actual YAML parse. The files it is used on --
+    reading a pubspec's `dependencies` block or a conda environment's `dependencies`/`pip`
+    lists -- only ever need a flat list of names back, and taking on a full YAML dependency
+    just to read that shape would be more machinery than the job requires.
     """
     names: list[str] = []
     section_indent = None
@@ -1096,12 +1101,13 @@ def infer_project_type(root: Path, frameworks: list[str]) -> str:
 # Continuous integration
 # ---------------------------------------------------------------------------
 
-#: How far a CI line is followed into the repository's own files. `make ci`, `npm run
-#: test:unit` and `bash scripts/test.sh` say nothing on their own; the Makefile, the
-#: package.json and the script say what they do, and reading them is an observation where
-#: guessing would not be. Two levels covers the shapes that occur (`make ci` -> `pytest`;
-#: `bash scripts/test-cov.sh` -> `bash scripts/test.sh` -> `pytest`) and terminates
-#: without needing a cycle check.
+#: How many hops `_expand_indirections` will chase a CI command into the repository's own
+#: files before giving up. `make ci` or `npm run test:unit` by itself is just a label; what
+#: it actually runs is only visible once the target's own Makefile recipe, package.json
+#: script, or shell script is opened and read, which turns a guess into an observation.
+#: Two hops covers the indirection chains seen in practice (`make ci` resolving straight to
+#: `pytest`, or `bash scripts/test-cov.sh` resolving to `bash scripts/test.sh` and then to
+#: `pytest`), and a fixed depth means there is no need to detect a cycle.
 CI_INDIRECTION_DEPTH = 2
 
 #: How much of a Makefile is read when a target is looked up, and how much of a shell
@@ -1186,13 +1192,17 @@ def _ci_indirection(root: Path, command: str) -> list[str]:
 
 
 def _expand_indirections(root: Path, commands: list[str], depth: int) -> list[str]:
-    """Replace `make ci` / `npm run test` / `bash scripts/test.sh` with what they run.
+    """Recursively swap each command for the lines it delegates to, down to `depth` levels.
 
-    The body *replaces* the surface command whenever it settles the question, so an `npm
-    test` script whose body is `eslint .` is a lint step and not a test step. When the body
-    settles nothing -- a recipe of `$(PYTHON) -m pytest`, where the runner hides behind a
-    variable -- the original command stays in the list too, since discarding it would
-    convert a correct detection into a missed one.
+    For every command, `_ci_indirection` looks up whatever Makefile target, npm script or
+    checked-in shell script it hands its work to, and that result is expanded again (one
+    fewer `depth`) before being judged. The expansion replaces the original command only when
+    at least one resolved line matches a known test, lint or type-check pattern -- so an `npm
+    test` script whose body only runs a linter reads correctly as a lint step, not a test
+    step. When nothing in the resolved body matches any of those patterns, the indirection is
+    treated as inconclusive and the original command is kept alongside it, since dropping it
+    on an inconclusive read would turn a real detection into a silent miss. Recursion stops
+    once `depth` reaches zero, and the commands are returned unchanged at that point.
     """
     if depth <= 0:
         return commands
@@ -1272,11 +1282,11 @@ def _substitute(command: str, env: dict[str, str]) -> str:
 
 
 def _yaml_steps(node, commands: list[str], actions: list[str]) -> None:
-    """Walk a parsed CI document for every command it runs and every action it calls.
+    """Recursively collect every command a parsed CI document runs and every action it invokes.
 
-    A subtree whose own `if:` or `when:` is a constant false is skipped: a step guarded by
-    `if: false` does not run, and counting it is how a switched-off suite reads as a live
-    one.
+    A subtree is skipped entirely when its own `if:` or `when:` evaluates to a literal
+    false, since a step gated that way never actually executes -- counting it anyway is
+    exactly how a suite someone switched off would still be reported as running.
     """
     if isinstance(node, dict):
         if _ci_disabled(node.get("if")) or _ci_disabled(node.get("when")):
@@ -1437,19 +1447,22 @@ SOURCE_SNIFF_BYTES = 4096
 
 
 def analyze_hygiene(root: Path, source_files: list[tuple[Path, str]]) -> dict:
-    """Two hygiene questions: is the dependency tree audited, and is input validated?
+    """Answer two hygiene questions without ever touching a credential.
 
-    Neither answer requires a credential, and no `.env` file is opened.
+    The two questions are whether the dependency tree is audited and whether input is
+    validated. Answering either never requires reading a credential, and this function
+    never opens a `.env` file to get there.
 
-    There is no secret scanner here and there never was one: this module holds no
-    credential pattern, never searches for a secret-shaped string and never opens a `.env`
-    file. `hardcoded_secret_hits` and `secret_hit_details` are kept in the result so the
-    emitted block is unchanged, and are permanently null and empty -- None means "not
-    collected by policy" and never "measured zero".
+    This module was never a secret scanner and does not become one here: there is no
+    credential-shaped pattern anywhere in it, nothing searches for a secret-looking string,
+    and `.env` is never opened. `hardcoded_secret_hits` and `secret_hit_details` still exist
+    in the returned dict, unchanged from the emitted shape, but they are permanently null
+    and empty respectively -- that null means "this tool does not collect this by policy",
+    which is a different statement from "measured and found zero".
 
-    What is left is hygiene that names nothing private: whether CI audits the dependency
-    tree, and which validation *libraries* -- public package names, not symbols read out
-    of the repository -- the source declares.
+    What actually gets reported names nothing private: whether the CI configuration runs a
+    dependency audit, and which validation *libraries* -- public package names, never a
+    symbol pulled out of the repository's own source -- the project declares as dependencies.
     """
     dep_audit_in_ci = False
     input_validation_patterns: list[str] = []

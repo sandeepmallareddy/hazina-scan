@@ -82,9 +82,9 @@ COMPLEXITY_LARGE_AT = 0.66
 #: of history: what it is meant to describe is the convention in force now.
 CONVENTIONAL_WINDOW = 200
 
-#: The "burst copy" fingerprint: several commits, in a couple of days, no merges, one or
-#: two people. The shape of a scaffold dumped and abandoned rather than developed. A
-#: single commit is not a burst -- that would flag every one-commit repository.
+#: Thresholds for the "dumped, not developed" pattern: a handful of non-merge commits, from
+#: at most two authors, landing within a short span of days. Requiring more than one commit
+#: keeps a normal single-commit repository from tripping this on its own.
 BURST_MIN_COMMITS = 2
 BURST_MAX_COMMITS = 12
 BURST_MAX_SPAN_DAYS = 2
@@ -93,8 +93,9 @@ BURST_MAX_AUTHORS = 2
 #: `git shortlog -sne` output: a count, a name, and an address in angle brackets.
 _SHORTLOG_LINE = re.compile(r"^\s*(\d+)\s+(.*?)\s+<(.+)>\s*$")
 
-#: A tag that names a version. The tag NAME is read to test this shape and then dropped:
-#: releases are routinely named after the product, the customer or an internal milestone.
+#: Matches a version-looking tag string. Only the tag's own spelling is checked and then
+#: discarded, because plenty of real releases are tagged after a product or a codename
+#: rather than a number, and this table only needs the ones that look numeric.
 _SEMVER_TAG = re.compile(r"^v?\d+\.\d+")
 
 #: One record per commit, fields separated by a unit separator so that a subject
@@ -115,11 +116,12 @@ def is_git_repo(repo: Path) -> bool:
 
 
 def author_key(name: str, email: str) -> str:
-    """A salted, run-local handle for one author.
+    """Turn a name/email pair into a salted digest good only for this run.
 
-    This is the only thing anywhere in this module derived from a name or an address. It
-    counts distinct authors and attributes two commits to the same person within a run;
-    it identifies nobody outside this process and survives no restart.
+    Used to tell whether two commits share an author and to count distinct authors,
+    nothing more. Nowhere else in this module does a name or address feed into anything;
+    the salt is regenerated per process, so the digest cannot be replayed outside it or
+    matched against a value produced on another run.
     """
     return hashlib.blake2b(
         f"{name}\x00{email}".encode("utf-8", "replace"), key=_AUTHOR_SALT, digest_size=8
@@ -171,17 +173,18 @@ def directory_diversity(files: list[str]) -> int:
 
 
 def parse_commits(repo: Path, limit: int, ref: str = "HEAD") -> list[dict]:
-    """Every commit reachable from `ref`, with its numstat, merges excluded.
+    """List `ref`'s non-merge commit history with per-commit file/line change counts.
 
-    `limit <= 0` reads the whole history, which is the default: substantive work is spread
-    across a repository's life and a window near the tip misrepresents it. A positive
-    limit is a fast-preview knob and nothing else.
+    `limit` defaults to 0, which walks every commit rather than a slice near the tip,
+    because a repository's real work is rarely concentrated at HEAD and a short window
+    would give a skewed picture. Pass a positive `limit` only for a quick look, not for a
+    figure meant to be trusted.
 
-    Every call in this module asks `env.run_git` NOT to set `core.quotepath=false`, so a
-    path with a non-ASCII character in it arrives in git's own quoted, octal-escaped form.
-    That is deliberate and it is the one thing here that is not the obvious choice: the
-    escaping decides which patterns a path matches, so `tests/café_test.py` is read as a
-    test only when both tools see it the same way, and the numbers have to agree.
+    One detail is easy to get backwards: git's quoting of non-ASCII paths is left ON here
+    (`core.quotepath` is never disabled for these calls), unlike some other callers in this
+    module. `tests/café_test.py` therefore reaches this function octal-escaped, and every
+    downstream pattern that classifies a path has to be written against that same escaped
+    form, or a non-ASCII test file silently stops being recognised as a test file.
     """
     args = ["log", f"--pretty=format:{_LOG_FORMAT}", "--numstat", "--no-merges"]
     if limit and limit > 0:

@@ -1,36 +1,43 @@
-"""The run itself: one budget, concurrent lanes, two documents, three files.
+"""Ties the independent collectors together into one timed run and two written documents.
 
-Every collector in this package answers one question about a repository and answers it
-alone. This module is what turns six of them into a measurement: it runs the independent
-ones at the same time against a single deadline, folds their raw output into the two
-documents the contract describes, and puts those through the write boundary --
-`schema.enforce`, then `redact.redact_tree`, then `redact.audit_no_leak` -- before anything
-reaches a disk.
+Each collector elsewhere in this package answers exactly one question about a repository,
+on its own, with no knowledge of the others. This module is the part that turns those
+separate answers into a single measurement: it schedules the independent collectors to run
+together against one shared deadline, merges what they return into the two output
+documents, and pushes both through the same write boundary before either touches disk --
+`schema.enforce` to validate shape, then `redact.redact_tree` to strip anything private,
+then `redact.audit_no_leak` as a final check.
 
-THE LANE GRAPH. Everything except the classification is independent of everything else, so
-the independent work runs concurrently and the wall clock is the slowest lane rather than
-the sum of all of them:
+HOW THE LANES ARE SCHEDULED. Only the classification step depends on another collector's
+output, so everything else runs concurrently and the run's wall-clock time tracks whichever
+lane is slowest rather than the sum of every lane:
 
-    phase 1, all at once    digest, tree, git (+ the calendar), structure, history, identity
-    phase 2, after phase 1  classify -- it reads the tree lane's output, and it is a pure
-                            function over a dict, so serialising it costs nothing
-    phase 3, ALONE          the build check, which is not in this release
+    stage 1, concurrent   digest, tree, git plus the commit-calendar work, structure,
+                           history, identity
+    stage 2, after stage 1  classify, which reads stage 1's tree output and is cheap to run
+                             afterwards since it is a pure function over a dict
+    stage 3, exclusive     the build check, run alone whenever a build level besides "none"
+                             was requested
 
-Phase 3 is empty here and the shape is still the shape, because the exclusivity is not a
-performance choice. A build check runs the project's own install and test commands INSIDE
-the checkout: it rewrites lockfiles and drops artefacts into the tree every other lane is
-reading, so overlapping it with a reader would not be slow, it would be wrong. `LaneClock`
-records the spans so `overlaps("build")` can be asserted on rather than reasoned about, and
-it answers `[]` today because the lane never runs.
+Stage 3 runs by itself for correctness, not speed. The build check executes the
+repository's own install and test commands directly inside the checkout, which can rewrite
+a lockfile or leave new files in a directory a reader lane is simultaneously scanning --
+running it concurrently would not merely be slower, it would corrupt what the readers see.
+So it waits until every reader lane has returned, and `LaneClock` records each lane's time
+span so that non-overlap with the build lane is something a test can assert directly rather
+than something the code merely claims.
 
-THE TWO DOCUMENTS. `measurement.json` is the full record -- the tree, git, classification
-and company-identity blocks plus the additive `ext_signals`. `codebase_repos.{json,csv}` is
-the flat row: numbers, dates, enums and public stack names only, built from the RAW
-collector output rather than from the redacted document, because a language name is a fact
-about a public technology and the scrub would read it as a symbol. Both are held to the
-same leak audit.
+WHAT GOES INTO EACH DOCUMENT. `measurement.json` holds the complete picture: the tree, git,
+classification and company-identity blocks, plus everything additive under `ext_signals`.
+`codebase_repos.{json,csv}` holds a flatter row of just numbers, dates, enum values and
+public stack names, and is assembled from the collectors' unredacted output rather than
+from the already-redacted `measurement` document -- a language name is public information
+about a technology, not something the scrubber should be touching, so building the row from
+redacted data would risk losing it. Both documents pass through the identical leak audit
+regardless.
 
-NULL IS NOT ZERO anywhere below. A field nothing measured is null; 0 means measured-none.
+A NULL FIELD IS NOT THE SAME AS ZERO anywhere in what follows: null means this tool could
+not measure the field, while 0 means it measured and found nothing.
 """
 
 from __future__ import annotations
@@ -49,6 +56,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__, classify, env, git, history, identity, redact, schema, structure, tree
+from .build import discover as build_discover
+from .build import probe as build_probe
 
 __all__ = [
     "Deadline",
@@ -61,6 +70,7 @@ __all__ = [
     "active_days",
     "build_git_block",
     "build_codebase_repos_row",
+    "build_lane",
     "row_status",
     "measure",
     "write_outputs",
@@ -77,33 +87,37 @@ VERSION_ENV_VAR = "HAZINA_SCAN_VERSION"
 # line per minute costs nothing, so it is never switched off.
 HEARTBEAT_SECONDS = 60
 
-# The intended ceiling on one repository, in seconds. It is RECORDED, NOT ENFORCED in this
-# release: a `Deadline` is built from it and reported on at the end, but every lane here is
-# a bounded local read and none of them asks it for a slice. Enforcement arrives with the
-# build check, which is the first lane that can run long enough to need it. The arithmetic
-# it is sized for is: whichever concurrent reader finishes last, within the budget less the
-# build reserve, then the build check within that reserve.
+# The ceiling on one repository, in seconds, and it is enforced. The arithmetic it is sized
+# for is: whichever concurrent reader finishes last, within the budget less the build
+# reserve, then the build check within that reserve. Work the allowance does not reach is
+# reported null with a reason beside it, so a short budget buys an incomplete answer and
+# never an understated one.
 DEFAULT_BUDGET_SECONDS = 9000
 
-# The build check's guaranteed share of that budget. It is the only lane that EXECUTES
-# anything, so it must not be the lane that gets whatever the others leave behind.
+# The minimum the build lane is guaranteed out of the overall budget, protected from being
+# starved by the other lanes. Unlike a reader, this lane actually runs the repository's own
+# commands, so it cannot be left to make do with only whatever time nobody else claimed.
 DEFAULT_BUILD_BUDGET_SECONDS = 1800
 
-# Ceiling for one command inside that check (an install, a build, a suite). Subordinate to
-# the two budgets above: a phase gets the smallest of this, its project's share, and what is
-# left overall.
+# The most one build-lane command (install, build, or the test run) may take. This is a
+# ceiling, not a guarantee: an individual phase actually gets whichever is smallest of this
+# value, its project's own share of the lane budget, and however much time remains overall.
 DEFAULT_TIMEOUT_BUILD = 900
 
-# How long a full attempt may run before the measurement is completed at the cheaper level.
+# The time ceiling on a "full" build attempt before this tool gives up on it and finishes
+# the measurement at the lighter "discover" level instead.
 DEFAULT_FULL_ATTEMPT_SECONDS = 900
 
 # How many projects inside one repository the build check may reach.
 DEFAULT_MAX_BUILD_PROJECTS = 8
 
-_NOT_YET_BUILT = "the build check arrives in a later release"
+# Ceiling for one git invocation in a reader lane, before the allowance shortens it. Long
+# enough that a large history is never cut off on a generous budget, and short enough that a
+# repository whose history reads pathologically slowly cannot sit on the run by itself.
+DEFAULT_TIMEOUT_GIT = 600
 
-# Lane display names for the timing sentence on the terminal. Keys not listed here fall back
-# to their own name with underscores turned into spaces.
+# How each lane's internal name should read in the terminal's timing summary. A lane not
+# listed here just has its underscores swapped for spaces and is shown as-is.
 _LANE_WORDS = {
     "tree": "tree scan",
     "git": "history scan",
@@ -127,16 +141,21 @@ def measurer_version() -> str:
 class Deadline:
     """A single wall-clock allowance, held against a monotonic reference.
 
-    Nothing in this release consults it to decide whether to stop. Every lane is a bounded
-    local read, so none of them calls `slice()`, and the object exists to be started,
-    reported against and carried into the release that does enforce it.
+    One object is in charge of how much time is left and nothing may ask for more than that.
+    Per-lane ceilings on their own would bound nothing, because several generous ceilings in
+    sequence add up to no ceiling at all; here each lane asks this object what it may take,
+    and the answer shrinks as the run goes on.
 
-    The design it is built for puts one object in charge of how much time is left, with
-    nothing permitted to ask for more than that. Per-lane ceilings would not bound anything,
-    because several generous ceilings in sequence add up to no ceiling at all. Once
-    enforcement lands, work the allowance does not reach is to be recorded as unmeasured
-    with the reason beside it, so that a short budget yields an incomplete answer and never
-    an understated one.
+    Not every lane consults this object, and that is worth being explicit about: the
+    git-backed lanes (through `env.git_ceiling`) and the build check draw their ceilings
+    from here and are genuinely bounded by it. `tree`, `structure`, `identity` and the
+    content digest never ask this object anything -- they are bounded instead by their own
+    file-count and byte-size caps, independent of how much of the budget is left.
+
+    For the lanes that do consult it, work the allowance does not reach is recorded as
+    unmeasured with the reason beside it. That is the point of enforcing it there: a short
+    budget has to yield an incomplete answer rather than an understated one, since a low
+    number and no number are read very differently by whoever gets the files.
     """
 
     def __init__(self, budget_seconds: int) -> None:
@@ -499,9 +518,10 @@ def active_days(repo: Path, tip: str) -> int | None:
 # Field mapping -- the flat row and the git block
 # ---------------------------------------------------------------------------
 
-# Content signals only. A repository NAME cannot on its own settle whether a repository is
-# a demo -- "poc", "sample", "playground" and "starter" are ordinary words in product
-# repository names -- and the only name this tool has is the directory it was pointed at.
+# Deliberately keyed off content, not naming. A directory called "poc" or "starter" is not
+# reliable evidence by itself -- those same words show up in plenty of real product
+# repositories -- and in any case the only "name" available here is whatever the checkout
+# directory happened to be called on disk.
 _STRONG_DEMO_KEYS = (
     "known_demo_app",
     "authoritative_demo",
@@ -542,12 +562,11 @@ def build_git_block(raw: dict) -> dict:
 def row_status(build: dict | None) -> tuple[str, str | None]:
     """Decide the row's two completeness columns. `measured` means every lane delivered.
 
-    Only the build check can leave a gap in this row, and no build check runs in this
-    release, so `build` arrives as None and the answer is always `measured` today. The
-    general case is written out regardless: the alternative would be a hard-coded string now
-    and a rewrite the day the lane ships, and this is the column people filter on. A row
-    claiming `measured` while a check had died would be asserting a completeness that never
-    existed.
+    Only the build check can leave a gap in this row, so `build` is the one block consulted;
+    a run that asked for no check passes None and is `measured` by definition. This is the
+    column people filter on, and a row claiming `measured` while a check had died would be
+    asserting a completeness the run never achieved, with the explanation buried in a nested
+    block nobody queries.
 
     Where both apply, a timeout is the reason given rather than a failure. The person
     reading the row can raise a budget themselves, whereas a failure sends them off to fix a
@@ -737,10 +756,12 @@ def write_outputs(out_dir: Path, row: dict, measurement: dict) -> list[Path]:
 
 
 def _git_lane(repo: Path, git_top: int) -> tuple[dict, dict]:
-    """The git collector plus the calendar it needs a tip commit for.
+    """Run the git collector and, right after it, the commit calendar that needs its tip.
 
-    One lane rather than two: the calendar depends on the effective tip, and both halves are
-    log walks over the same history, so splitting them would only add a barrier.
+    These stay one lane instead of two because the calendar cannot start until it knows the
+    effective tip commit the git collector resolves, and both pieces of work are just log
+    walks over the same history -- giving them separate lanes would add a synchronisation
+    point without actually letting either one start any sooner.
     """
     git_raw = git.collect(repo, git_top=git_top)
     git_block = build_git_block(git_raw)
@@ -748,6 +769,98 @@ def _git_lane(repo: Path, git_top: int) -> tuple[dict, dict]:
     git_block["commits_by_month"] = commits_by_month(repo, tip)
     git_block["active_days"] = active_days(repo, tip)
     return git_raw, git_block
+
+
+def build_lane(
+    repo: Path,
+    level: str,
+    probe_budget: int,
+    timeout_build: int,
+    max_projects: int,
+    full_attempt_seconds: int,
+    deadline: Deadline,
+) -> dict:
+    """Attempt the build check at `level`, dropping to `discover` if a `full` run stalls.
+
+    A `full` attempt is the only one that executes the test suite, so it is also the only
+    one that can produce a real executed-runnability score or a coverage figure. Left
+    without a fallback, a repository whose suite happens to take an hour would come back
+    with nothing measured at all -- and reporting nothing reads worse than reporting a low
+    score, because an unmeasured repository looks indistinguishable from a broken one.
+
+    The retry at `discover` is only worth running in exactly one situation: the `full`
+    attempt's own clock ran out before the suite finished, leaving the executed index with
+    no value to report. Every other way a `full` attempt can end already has a complete
+    answer and gains nothing from a second pass:
+
+      * an outright build failure, or a runner that found no tests, is a real fact about the
+        repository. The record already has install, build and discovery verdicts on it, so
+        re-running `discover` would just spend more of the reserve confirming what is
+        already known, for a lower (and correct) score rather than a missing one.
+      * a runtime this machine cannot supply, or a package index it cannot reach, is this
+        tool's own limitation rather than the repository's, and the indices affected are
+        already null with that attribution recorded. Trying again would hit the same missing
+        runtime and add nothing.
+
+    The two attempts share a single time allowance rather than getting independent timers:
+    the `full` attempt draws up to `full_attempt_seconds` from the reserve, and whatever it
+    leaves unspent -- capped by what the overall `Deadline` still allows -- is all the
+    fallback gets. Together they can never exceed the reserve, so the run-wide budget stays
+    intact, and each attempt snapshots and restores the tree independently so a retry cannot
+    weaken the guarantee that the checkout is left as it was found.
+    """
+    if level != "full":
+        result = build_probe.collect(
+            repo,
+            level=level,
+            budget_seconds=probe_budget,
+            timeout=timeout_build,
+            max_projects=max_projects,
+        )
+        result["build_level_requested"] = level
+        return result
+
+    reserve = build_discover.Budget(probe_budget, phase_cap=timeout_build)
+    attempt = min(full_attempt_seconds, probe_budget)
+    result = build_probe.collect(
+        repo,
+        level="full",
+        budget_seconds=attempt,
+        timeout=timeout_build,
+        max_projects=max_projects,
+    )
+    result["build_level_requested"] = "full"
+    if not (result.get("run_budget_exhausted") and result.get("observed_runnability") is None):
+        return result
+
+    left = int(min(reserve.remaining(), deadline.remaining()))
+    if left < build_probe.MIN_PHASE_SECONDS:
+        result["build_level_fallback_reason"] = (
+            f"the suite did not finish inside its {int(attempt)} second share of the build "
+            f"budget, and too little of the budget was left to finish the measurement at "
+            f"the cheaper level; the executed indices are null with a reason rather than "
+            f"scored low"
+        )
+        print(f"[build] {result['build_level_fallback_reason']}", file=sys.stderr, flush=True)
+        return result
+
+    fallback = build_probe.collect(
+        repo,
+        level="discover",
+        budget_seconds=left,
+        timeout=timeout_build,
+        max_projects=max_projects,
+    )
+    fallback["build_level_requested"] = "full"
+    fallback["build_level_fallback_reason"] = (
+        f"the suite did not finish inside its {int(attempt)} second share of the build "
+        f"budget, so the measurement was finished at the cheaper level with the {left} "
+        f"seconds that were left; dependencies, the build and the test listing are executed "
+        f"facts, the suite itself never ran, and the executed index is unscored with a "
+        f"reason rather than scored low"
+    )
+    print(f"[build] {fallback['build_level_fallback_reason']}", file=sys.stderr, flush=True)
+    return fallback
 
 
 def measure(
@@ -771,23 +884,36 @@ def measure(
     All string leaves in both returned documents have been through the declaration
     boundary, the scrub and the leak audit before this returns, in that order.
 
-    `build_level` must be `"none"`. `build_budget`, `timeout_build`, `max_build_projects`
-    and `full_attempt_seconds` size a build check and are accepted and carried so the
-    signature does not change under its callers the day that lane lands; passing any level
-    other than `"none"` raises rather than quietly measuring less than it was asked for.
-    `deadline` likewise: every lane here is a bounded local read, so nothing draws a slice
-    from it yet, and it exists so one caller can put several repositories under one clock.
+    `build_level` is `"none"`, `"discover"` or `"full"`, and it defaults to `"none"` here
+    even though the command line defaults to `"full"`: executing somebody's install hooks is
+    a thing a caller asks for out loud, never a thing they get by saying nothing. The other
+    build arguments size that check -- its reserved share of the budget, the ceiling on one
+    command inside it, how many project roots it may reach, and how long a `full` attempt
+    may run before the measurement is finished at the cheaper level.
+
+    `deadline` is the one allowance the whole run is held to, and passing one is how several
+    repositories share a clock. Every lane draws its own ceiling from it; a lane the
+    allowance does not reach reports null with a reason rather than raising.
 
     Neither the wall-clock table nor the timing sentence is printed from here. Both are on
     `clock`, and what a run SAYS is the caller's decision -- this returns documents.
     """
-    if build_level != "none":
-        raise NotImplementedError(_NOT_YET_BUILT)
+    if build_level not in build_probe.BUILD_LEVELS:
+        raise ValueError(
+            f"unknown build level {build_level!r}; expected one of {build_probe.BUILD_LEVELS}"
+        )
 
     repo = Path(repo).resolve()
     measured_at = datetime.now(UTC).isoformat()
     clock = clock if clock is not None else LaneClock()
     deadline = deadline if deadline is not None else Deadline(DEFAULT_BUDGET_SECONDS)
+    do_build = build_level != "none"
+
+    # Time held back from the readers for the one lane that EXECUTES anything. It is carved
+    # out only when there is a build check to protect, and never at the cost of more than
+    # half the allowance: starving the readers to guarantee a build check would trade the
+    # measurements that always work for the one that sometimes cannot.
+    reserve = min(build_budget, deadline.total // 2) if do_build else 0
 
     # Resolved up front, ahead of the fan-out. Two consumers want this name -- the
     # measurement document and the identity lane -- it costs one `git config`, and the
@@ -809,7 +935,11 @@ def measure(
     }
 
     def run(name: str, thunk):
-        with clock.lane(name):
+        # The slice is taken when the lane STARTS, not when the fan-out was planned, so a
+        # lane that had to queue for a worker inherits the shorter allowance it deserves.
+        # `git_ceiling` is thread-local and this function is what runs on the worker thread,
+        # which is why the ceiling is entered here rather than around the pool.
+        with clock.lane(name), env.git_ceiling(deadline.slice(DEFAULT_TIMEOUT_GIT, reserve)):
             return thunk()
 
     workers = jobs if jobs and jobs > 0 else len(lanes)
@@ -830,16 +960,65 @@ def measure(
         with clock.lane("classify"):
             classify_raw = classify.classify(tree_raw, threshold)
 
-        # --- phase 3: the build check, alone, after every reader. Not in this release. ---
+        # --- phase 3: the build check, alone, once every reader has finished ---
         build_ok = None
         testable_at_head = None
         build_raw = None
+        if do_build:
+            with clock.lane("build"):
+                # The remainder, capped by the reserve. The check shares that out among
+                # its projects and phases itself and records the ones it could not reach as
+                # skipped, so a spent budget costs measurements and never accuracy.
+                probe_budget = min(build_budget, int(deadline.remaining()))
+                if probe_budget < build_probe.MIN_PHASE_SECONDS:
+                    build_raw = build_probe.skipped_budget(deadline.remaining())
+                    print(
+                        f"[budget] the build check never started: {probe_budget}s of the "
+                        f"{deadline.total}s budget were left when its turn came",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    build_raw = build_lane(
+                        repo,
+                        build_level,
+                        probe_budget,
+                        timeout_build,
+                        max_build_projects,
+                        full_attempt_seconds,
+                        deadline,
+                    )
+            build_ok = build_raw.get("build_ok")
+            testable_at_head = build_raw.get("build_and_tests_ran")
+            if build_raw.get("note"):
+                print(f"[budget] build check: {build_raw['note']}", file=sys.stderr, flush=True)
+            # The level that actually happened, said out loud on every run. Somebody reading
+            # an unscored executed index needs to be told this, not left to work it out.
+            if build_raw.get("build_level"):
+                ran_at = build_raw["build_level"]
+                asked = build_raw.get("build_level_requested")
+                fell_back = "" if ran_at == asked else f" (asked for {asked})"
+                print(
+                    f"[build] ran at level {ran_at}{fell_back}; "
+                    f"observed_runnability={build_raw.get('observed_runnability')}, "
+                    f"discover_runnability={build_raw.get('discover_runnability')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if build_raw.get("observed_runnability_reason"):
+                print(
+                    f"[build] the executed index is unscored: "
+                    f"{build_raw['observed_runnability_reason']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     finally:
         clock.stop_heartbeat()
 
-    # Capacity is the deterministic count of mineable commits across history, which the
-    # history collector owns. Unavailable -> null: a wrong number under the right name is
-    # worse than no number at all.
+    # "Capacity" is just the mineable-commit count the history collector already computed
+    # deterministically. When that collector could not produce it, this stays null rather
+    # than defaulting to some other number -- a plausible-looking wrong value here would be
+    # more misleading than an honest gap.
     capacity = history_raw.get("mineable_commits") if history_raw.get("ok") else None
 
     is_demo, demo_reasoning = _demo(tree_raw)
@@ -860,8 +1039,8 @@ def measure(
         # records will be organised by repository name, and matching the two by hand is
         # guesswork.
         "real_repo_name": full_name,
-        # WHOSE code this is, which is a different question from WHICH repository it is,
-        # and one nothing else in the output answers.
+        # Records who owns this code, as distinct from `real_repo_name` above it, which only
+        # identifies which repository this is. No other field in the document covers this.
         "company_identity": company,
         "variant": "ext",
         "tree": tree_raw,
@@ -884,9 +1063,10 @@ def measure(
     measurement = redact.redact_tree(measurement)
     redact.audit_no_leak(measurement)
 
-    # The flat row holds numbers, dates, enums and public stack-name lists only, so it is
-    # built from the RAW collector output -- real language and framework names -- and
-    # verified by the same audit, which exempts the provenance and stack-fact fields.
+    # This flat row keeps only numbers, dates, enum values and public technology-stack
+    # names, so it is built straight from the collectors' unredacted output -- genuine
+    # language and framework names -- and then run through the same leak audit, which
+    # already carves out an exemption for the provenance and stack-fact fields.
     status, skip_reason = row_status(build_raw)
     row = build_codebase_repos_row(
         tree_block=tree_raw,
