@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hazina-scan"
+dynamic = ["version"]
+description = "Fast, numbers-only measurement of a code repository, run by its owner."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sandeep Mallareddy", email = "msandeep85@gmail.com" }]
+classifiers = [
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Quality Assurance",
+  "Intended Audience :: Developers",
+]
+dependencies = [
+  "tree-sitter==0.26.0",
+  "tree-sitter-language-pack==1.13.5",
+  "PyYAML==6.0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/sandeepmallareddy/hazina-scan"
+Issues = "https://github.com/sandeepmallareddy/hazina-scan/issues"
+Changelog = "https://github.com/sandeepmallareddy/hazina-scan/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "pre-commit>=3", "build>=1", "pip-audit>=2"]
+
+[project.scripts]
+hazina-scan = "hazina_scan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hazina_scan*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hazina_scan.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# docs are not part of the package
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
