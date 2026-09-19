@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "tree-sitter==0.26.0",
-  "tree-sitter-language-pack==1.13.5",
+  "tree-sitter-language-pack==1.20.0",
   "PyYAML==6.0.3",
 ]
 
