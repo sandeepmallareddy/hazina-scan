@@ -9,7 +9,7 @@ description = "Fast, numbers-only measurement of a code repository, run by its o
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Sandeep Mallareddy", email = "msandeep85@gmail.com" }]
+authors = [{ name = "Sandeep Mallareddy", email = "partners@hazinalabs.com" }]
 classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

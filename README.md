@@ -13,12 +13,12 @@ Questions: **[partners@hazinalabs.com](mailto:partners@hazinalabs.com)**
 Needs Python 3.11+ and git.
 
 ```bash
-pipx install "git+https://github.com/sandeepmallareddy/hazina-scan.git@v0.3.0"
+pipx install "git+https://github.com/sandeepmallareddy/hazina-scan.git@v0.3.1"
 ```
 
 Or download the wheel from the
 [latest release](https://github.com/sandeepmallareddy/hazina-scan/releases/latest) and run
-`pipx install ./hazina_scan-0.3.0-py3-none-any.whl`.
+`pipx install ./hazina_scan-0.3.1-py3-none-any.whl`.
 
 ## 2. Run
 
@@ -89,7 +89,7 @@ NOT COLLECTED BY POLICY -- 35 declared fields, never filled in
     path: the names of files and directories are not collected
     ...
 
-repo-6f0519253f51  <-  requests: measured
+requests  ->  repo-6f0519253f51: measured
 wrote /tmp/scan/hazina-out.zip
 index (local only, not in the zip): /tmp/scan/hazina-out/INDEX.local.txt
 ```
@@ -98,8 +98,7 @@ That run took 79 seconds. Add `--review` to print every field and its value.
 
 ## What is in the zip
 
-One folder per repository, named by an anonymous handle such as `repo-6f0519253f51`. Each
-folder holds three files:
+One folder per repository. Each folder holds three files:
 
 | File | Contents |
 |---|---|
@@ -107,8 +106,12 @@ folder holds three files:
 | `codebase_repos.csv` | The same row as CSV. |
 | `measurement.json` | The full record, including the build result and coverage. |
 
-`INDEX.local.txt` tells you which folder is which repository. It stays on your machine and is
-never put in the zip.
+**On your machine** the folders carry your repository's folder name (`hazina-out/requests/`), so
+you can find things. **Inside the zip** each folder is renamed to an anonymous handle
+(`repo-6f0519253f51`). Your folder names do not travel.
+
+`INDEX.local.txt` lists both names side by side. It stays on your machine and is never put in
+the zip.
 
 `null` means *not measured*. `0` means *measured, and the answer is none*. A missing language
 runtime or an unreachable registry is reported as not measured. It never counts against your

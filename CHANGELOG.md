@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts without an executable bit) — the matrix runs Windows as allowed-to-fail until
   then.
 
+## [0.3.1] - 2026-09-19
+
+### Changed
+
+- **Output folders on disk carry the repository's folder name again**, so results are
+  easy to find -- a repeated folder name is suffixed `-2`, `-3`, as before 0.3.0. **The
+  zip renames each folder to its anonymous handle as it packs it**, so no directory name
+  travels with `hazina-out.zip`; two folders sharing a handle (identical trees) are still
+  suffixed `-2`, `-3` inside the zip. `INDEX.local.txt` lists both names side by side.
+- Package author contact is now **partners@hazinalabs.com**.
+
 ## [0.3.0] - 2026-09-19
 
 ### Changed
