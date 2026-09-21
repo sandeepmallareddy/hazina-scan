@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lanes_unavailable` branch is unreachable. This is by design, not a bug: it is worth
   noting as dead code to simplify later.
 - Windows support for the build check (venv `Scripts` layout, PATHEXT lookup, wrapper
-  scripts without an executable bit) — the matrix runs Windows as allowed-to-fail until
+  scripts without an executable bit) — the release check runs Windows as allowed-to-fail until
   then.
 
 ## [0.3.1] - 2026-09-19

@@ -5,8 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "30 1 * * 0"
+  # Add a weekly `schedule:` trigger when the repository is public.
 
 permissions:
   security-events: write
